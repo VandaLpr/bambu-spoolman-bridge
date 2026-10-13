@@ -135,7 +135,7 @@ export function createRecordingNotifier() {
 
 // Entity maps for one printer. update() returns a NEW map (the tracker compares objects),
 // keeping unchanged entity objects identical, like home-assistant-js-websocket does.
-export function createWorld(prefix, initial = {}) {
+export function createWorld(prefix, initial = {}, initialAt = undefined) {
   let entities = {};
   const id = {
     status: `sensor.${prefix}_print_status`,
@@ -148,15 +148,18 @@ export function createWorld(prefix, initial = {}) {
   };
   const tray = (n) => `sensor.${prefix}_ams_1_tray_${n}`;
 
-  function update(changes) {
+  // at: optional HA timestamp for every entity in this update (last_changed/last_updated),
+  // the way HA stamps entities that change together.
+  function update(changes, at = undefined) {
     entities = { ...entities };
     for (const [key, value] of Object.entries(changes)) {
       const entityId = id[key] ?? key;
       const { state = String(value), attributes = {} } = typeof value === 'object' && value !== null ? value : {};
-      entities[entityId] = { entity_id: entityId, state, attributes };
+      const stamp = at ? { last_changed: at, last_updated: at } : {};
+      entities[entityId] = { entity_id: entityId, state, attributes, ...stamp };
     }
     return entities;
   }
-  update(initial);
+  update(initial, initialAt);
   return { id, tray, update, get: () => entities };
 }

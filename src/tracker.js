@@ -1,6 +1,15 @@
 // Per-printer job tracker. Watches the printer's entities, runs the lifecycle rules,
 // snapshots and resolves sources at print start and records deductions at print end.
 // All work for one printer runs through a serial queue, so handlers never interleave.
+//
+// Stale values at print start (seen in HA history): when "prepare" arrives, print_progress
+// can still hold the previous print's 100 and print_weight the previous print's grams.
+// Both printers update print_weight only with "running". Therefore:
+//   - a fresh job ignores the current progress; only progress changes after the start count
+//   - the snapshot waits for a print_weight updated after the job's "prepare" (jobs.started_at,
+//     persisted so a restart in between waits too; fallback: the current value after weightWaitMs)
+//   - a print cancelled before any progress gets no snapshot at all
+//   - at bridge startup, progress counts only if HA changed it after the print's start_time
 
 import { computeDeductions, round2 } from './deduction.js';
 import { decide, isSignificant, startTimeDiffers, TERMINAL } from './lifecycle.js';
@@ -18,14 +27,28 @@ export class PrinterTracker {
    * @param {object} deps.ids       from resolveEntities()
    * @param {Function} deps.loadedTrayUuids  () => tray_uuids loaded in any AMS of any printer
    */
-  constructor({ printer, ids, store, executor, notifier, ha, config, log, loadedTrayUuids = () => [], sleep = realSleep, debounceMs = 2000 }) {
-    Object.assign(this, { printer, ids, store, executor, notifier, ha, config, log, loadedTrayUuids, sleep, debounceMs });
+  constructor({
+    printer,
+    ids,
+    store,
+    executor,
+    notifier,
+    ha,
+    config,
+    log,
+    loadedTrayUuids = () => [],
+    sleep = realSleep,
+    debounceMs = 2000,
+    weightWaitMs = 60_000,
+  }) {
+    Object.assign(this, { printer, ids, store, executor, notifier, ha, config, log, loadedTrayUuids, sleep, debounceMs, weightWaitMs });
     this.prefix = printer.prefix;
     this.entities = {};
     this.lastSignificant = null;
     this.started = false;
     this.queue = Promise.resolve();
     this.weightTimer = null;
+    this.waitTimer = null; // fallback snapshot while waiting for this print's print_weight
     this.notified = new Map(); // pending id -> candidate signature already sent
   }
 
@@ -46,9 +69,34 @@ export class PrinterTracker {
     return known(s) ? s : null;
   }
 
+  entity(key) {
+    const id = this.ids[key];
+    return id ? this.entities[id] : undefined;
+  }
+
   progress() {
     const n = Number(this.state('progress'));
     return Number.isFinite(n) ? n : 0;
+  }
+
+  // Bridge startup only: the current progress, if it belongs to the running print, i.e.
+  // HA changed it at or after the print's start_time. Otherwise 0.
+  trustedStartupProgress() {
+    if (this.state('status') !== 'running') return 0;
+    const start = Date.parse(this.value('startTime'));
+    const changed = Date.parse(this.entity('progress')?.last_changed);
+    if (Number.isNaN(start) || Number.isNaN(changed)) return 0;
+    return changed >= start ? this.progress() : 0;
+  }
+
+  // print_weight was updated at or after `since` (HA time). Without timestamps it can't be
+  // judged and counts as fresh.
+  weightIsFresh(since) {
+    const pw = this.entity('printWeight');
+    const updated = Date.parse(pw?.last_updated ?? pw?.last_changed);
+    const start = Date.parse(since);
+    if (Number.isNaN(updated) || Number.isNaN(start)) return true;
+    return updated >= start;
   }
 
   trayAttributes() {
@@ -113,6 +161,12 @@ export class PrinterTracker {
   stop() {
     clearTimeout(this.weightTimer);
     this.weightTimer = null;
+    this.clearWait();
+  }
+
+  clearWait() {
+    clearTimeout(this.waitTimer);
+    this.waitTimer = null;
   }
 
   // --- handlers --------------------------------------------------------------------
@@ -140,8 +194,12 @@ export class PrinterTracker {
       return this.startJob({ status, startup, previous });
     }
     if (action === 'continue') {
-      this.store.raiseMaxProgress(job.id, this.progress());
-      if (!this.store.getJobSources(job.id).length) await this.snapshot(job.id, { refresh: false });
+      // At runtime, progress arrives through handleProgress(); the current value may be stale.
+      if (startup) this.store.raiseMaxProgress(job.id, this.trustedStartupProgress());
+      if (this.store.getJobSources(job.id).length) return;
+      // Jobs from before started_at was stored (null) count as fresh.
+      if (this.weightIsFresh(job.started_at)) await this.snapshot(job.id);
+      else if (startup) this.waitForWeight(job.id); // restarted between prepare and running
       return;
     }
     if (action === 'end') return this.endJob(job, status);
@@ -167,12 +225,14 @@ export class PrinterTracker {
     const job = this.activeJob();
     if (!job) return;
     // print_weight is final once the print is under way; later changes belong to the next print.
+    // max_progress only holds progress reported after the job started (or trusted at startup),
+    // so a stale 100 from the previous print can't block this.
     if (this.store.getJob(job.id).max_progress > 0) return;
     const current = parsePrintWeight(this.attrs('printWeight')).sources.map((s) => `${s.sourceKey}=${s.grams}`).join(',');
     const stored = this.store.getJobSources(job.id).map((s) => `${s.source_key}=${s.grams}`).join(',');
     if (current === stored) return;
-    this.log.info(`print_weight changed before the print got going; re-snapshot (${stored || 'empty'} -> ${current})`);
-    await this.snapshot(job.id, { refresh: false });
+    this.log.info(`print_weight for job ${job.id}: ${stored || 'none yet'} -> ${current}; snapshot`);
+    await this.snapshot(job.id);
   }
 
   async checkActiveTray() {
@@ -209,21 +269,55 @@ export class PrinterTracker {
       this.log.info(`running without prepare ignored: ${stale}`);
       return;
     }
-    const startTime = this.value('startTime');
-    const adopted = startup || this.progress() > 0;
+    // Only a print already running when the bridge starts is adopted. started_at is HA's
+    // time of the status that started the job; print_weight must be newer to be this print's.
+    const startedAt = this.entity('status')?.last_changed ?? null;
     const jobId = this.store.createJob({
       printer: this.prefix,
       taskName: this.value('taskName'),
-      startTime,
-      adopted,
+      startTime: this.value('startTime'),
+      startedAt,
+      adopted: startup,
       dryRun: this.config.dryRun,
     });
-    this.store.raiseMaxProgress(jobId, this.progress());
-    this.log.info(`job ${jobId} ${adopted ? 'adopted' : 'started'}: "${this.value('taskName') ?? '?'}"`);
-    await this.snapshot(jobId, { refresh: true });
+    if (startup) this.store.raiseMaxProgress(jobId, this.trustedStartupProgress());
+    this.log.info(`job ${jobId} ${startup ? 'adopted' : 'started'}: "${this.value('taskName') ?? '?'}"`);
+
+    if (this.ids.refreshButton) {
+      try {
+        await this.ha.pressButton(this.ids.refreshButton);
+      } catch (e) {
+        this.log.warn(`force refresh failed: ${e.message ?? e}`);
+      }
+    }
+    // A print found running at startup already has its print_weight (set with "running").
+    if ((startup && status === 'running') || this.weightIsFresh(startedAt)) {
+      await this.sleep(this.printer.refreshDelayMs);
+      await this.snapshot(jobId);
+      return;
+    }
+    this.waitForWeight(jobId);
+  }
+
+  // print_weight still holds the previous print's values: handlePrintWeight() snapshots when
+  // this print's arrive; the fallback covers a reprint whose values are identical.
+  waitForWeight(jobId) {
+    this.clearWait();
+    this.log.info(`job ${jobId}: waiting for this print's print_weight`);
+    this.waitTimer = setTimeout(() => {
+      this.waitTimer = null;
+      this.enqueue('print_weight fallback', async () => {
+        const job = this.activeJob();
+        if (job?.id !== jobId || this.store.getJobSources(jobId).length) return;
+        this.log.info(`job ${jobId}: print_weight unchanged after ${this.weightWaitMs / 1000} s; using the current value`);
+        await this.snapshot(jobId);
+      });
+    }, this.weightWaitMs);
+    this.waitTimer.unref?.();
   }
 
   async missJob(job) {
+    this.clearWait();
     this.store.endJob(job.id, 'missed_end');
     this.log.warn(`job ${job.id} closed as missed_end: a new print started before its end was seen`);
     await this.notifier.problem(
@@ -232,17 +326,8 @@ export class PrinterTracker {
     );
   }
 
-  async snapshot(jobId, { refresh }) {
-    if (refresh) {
-      if (this.ids.refreshButton) {
-        try {
-          await this.ha.pressButton(this.ids.refreshButton);
-        } catch (e) {
-          this.log.warn(`force refresh failed: ${e.message ?? e}`);
-        }
-      }
-      await this.sleep(this.printer.refreshDelayMs);
-    }
+  async snapshot(jobId) {
+    this.clearWait();
     const job = this.store.getJob(jobId);
     if (!job || job.state !== 'active') return;
 
@@ -300,6 +385,18 @@ export class PrinterTracker {
 
   async endJob(job, status) {
     if (!TERMINAL.has(status)) return;
+    this.clearWait();
+    if (!this.store.getJobSources(job.id).length) {
+      // Cancelled before printing anything: print_weight may still be the previous print's and
+      // nothing was used, so no snapshot, no resolution (no Spoolman writes), no usage rows.
+      if (status === 'failed' && !(this.store.getJob(job.id).max_progress > 0)) {
+        this.store.endJob(job.id, 'failed', 0);
+        this.log.info(`job ${job.id} failed before printing anything: nothing to deduct`);
+        return;
+      }
+      // finish, or failed after progress: "running" happened, so print_weight is this print's.
+      await this.snapshot(job.id);
+    }
     const fresh = this.store.getJob(job.id);
     const sources = this.store.getJobSources(job.id);
     const deductions = computeDeductions(

@@ -36,6 +36,9 @@ test('pending notification: top 2 candidates plus Open bridge, LAN-only hint', a
   assert.match(payload.message, /A1 · "Test print"/);
   assert.match(payload.message, /External Spool \(PETG Bambu PETG Basic #FFFFFF\): several opened spools match/);
   assert.match(payload.message, /only on home Wi-Fi/);
+  // a plain tap opens the bridge page too
+  assert.equal(payload.data.url, 'http://bridge.local:8080/pending/7'); // iOS
+  assert.equal(payload.data.clickAction, 'http://bridge.local:8080/pending/7'); // Android
 });
 
 test('DRY_RUN prefixes every title', async () => {
@@ -49,6 +52,8 @@ test('without BRIDGE_URL there is no Open bridge button', async () => {
   const { calls, notifier } = capture({ bridgeUrl: null });
   await notifier.pending({ pending, printerName: 'A1', taskName: null, source });
   assert.equal(calls[0][2].data.actions.some((a) => a.action === 'URI'), false);
+  assert.equal('url' in calls[0][2].data, false);
+  assert.equal('clickAction' in calls[0][2].data, false);
 });
 
 test('a failing notify call is logged, not thrown', async () => {
@@ -61,4 +66,17 @@ test('action ids round-trip; foreign actions are ignored', () => {
   assert.equal(parseAction('URI'), null);
   assert.equal(parseAction('SOME_OTHER_AUTOMATION'), null);
   assert.equal(parseAction(undefined), null);
+});
+
+test('problem notifications get an Open bridge button for their page, but no tap link', async () => {
+  const { calls, notifier } = capture();
+  await notifier.problem('Deduction rejected by Spoolman', 'details', { path: '/usage/12' });
+  await notifier.problem('RFID tag conflict', 'details');
+  const [[, , withPage], [, , plain]] = calls;
+  assert.equal('url' in withPage.data, false);
+  assert.equal('clickAction' in withPage.data, false);
+  assert.deepEqual(withPage.data.actions, [{ action: 'URI', title: 'Open bridge', uri: 'http://bridge.local:8080/usage/12' }]);
+  assert.match(withPage.message, /only on home Wi-Fi/);
+  assert.deepEqual(plain.data, { group: 'bambu-spoolman-bridge' });
+  assert.equal(plain.message, 'details');
 });

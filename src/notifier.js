@@ -46,12 +46,17 @@ export function createNotifier({ ha, service, dryRun, bridgeUrl, log }) {
     }
   }
 
+  const openBridge = (path) => ({ action: 'URI', title: 'Open bridge', uri: `${bridgeUrl}${path}` });
+
   return {
     async pending({ pending, printerName, taskName, source }) {
+      const page = `${bridgeUrl}/pending/${pending.id}`;
       const actions = pending.candidates.slice(0, MAX_BUTTONS).map((c) => ({ action: actionId(pending.id, c.spoolId), title: c.label }));
-      if (bridgeUrl) actions.push({ action: 'URI', title: 'Open bridge', uri: `${bridgeUrl}/pending/${pending.id}` });
+      if (bridgeUrl) actions.push(openBridge(`/pending/${pending.id}`));
       await send('Which spool?', pendingMessage({ pending, printerName, taskName, source }), {
         actions,
+        // A plain tap opens the bridge page too: url for iOS, clickAction for Android.
+        ...(bridgeUrl ? { url: page, clickAction: page } : {}),
         tag: `bsb-pending-${pending.id}`,
         group: 'bambu-spoolman-bridge',
       });
@@ -60,7 +65,7 @@ export function createNotifier({ ha, service, dryRun, bridgeUrl, log }) {
     problem: (title, message, { path = null } = {}) =>
       send(title, path && bridgeUrl ? `${message}\nThe bridge link works only on home Wi-Fi.` : message, {
         group: 'bambu-spoolman-bridge',
-        ...(path && bridgeUrl ? { actions: [{ action: 'URI', title: 'Open bridge', uri: `${bridgeUrl}${path}` }] } : {}),
+        ...(path && bridgeUrl ? { actions: [openBridge(path)] } : {}),
       }),
   };
 }

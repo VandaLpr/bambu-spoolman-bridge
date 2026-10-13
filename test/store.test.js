@@ -71,7 +71,7 @@ test('updateJobMeta keeps known values when HA reports unknown', () => {
   assert.equal(job.start_time, '2026-10-12T22:18:59+00:00');
 });
 
-test('a v1 database is migrated: usage_log gets the attempts column', async () => {
+test('a v1 database is migrated: usage_log.attempts and jobs.started_at are added', async () => {
   const { mkdtempSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -79,11 +79,13 @@ test('a v1 database is migrated: usage_log gets the attempts column', async () =
   const file = join(dir, 'bridge.db');
   const v2 = openStore(file);
   v2.db.exec('ALTER TABLE usage_log DROP COLUMN attempts');
+  v2.db.exec('ALTER TABLE jobs DROP COLUMN started_at');
   v2.db.pragma('user_version = 1');
   v2.close();
   const migrated = openStore(file);
-  assert.equal(migrated.db.pragma('user_version', { simple: true }), 2);
-  const jobId = migrated.createJob({ printer: 'p2s', dryRun: false });
+  assert.equal(migrated.db.pragma('user_version', { simple: true }), 3);
+  const jobId = migrated.createJob({ printer: 'p2s', startedAt: '2026-10-13T21:10:59.844Z', dryRun: false });
+  assert.equal(migrated.getJob(jobId).started_at, '2026-10-13T21:10:59.844Z');
   const id = migrated.recordUsage({ jobId, printer: 'p2s', sourceKey: 'AMS 1 Tray 1', spoolId: 1, grams: 1, status: 'finish', dryRun: false, writeState: 'queued' });
   assert.equal(migrated.countUsageAttempt(id), 1);
   migrated.close();

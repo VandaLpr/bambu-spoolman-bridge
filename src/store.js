@@ -21,7 +21,7 @@
 
 import Database from 'better-sqlite3';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const SCHEMA = `
 CREATE TABLE jobs (
@@ -104,8 +104,8 @@ export function openStore(file) {
   const parsePending = (row) => row && { ...row, candidates: JSON.parse(row.candidates) };
 
   const q = {
-    insertJob: stmt(`INSERT INTO jobs (printer, task_name, start_time, state, adopted, dry_run, created_at)
-                     VALUES (@printer, @taskName, @startTime, 'active', @adopted, @dryRun, @createdAt)`),
+    insertJob: stmt(`INSERT INTO jobs (printer, task_name, start_time, started_at, state, adopted, dry_run, created_at)
+                     VALUES (@printer, @taskName, @startTime, @startedAt, 'active', @adopted, @dryRun, @createdAt)`),
     activeJob: stmt(`SELECT * FROM jobs WHERE printer = ? AND state = 'active' ORDER BY id DESC LIMIT 1`),
     activeJobs: stmt(`SELECT * FROM jobs WHERE state = 'active' ORDER BY id`),
     job: stmt(`SELECT * FROM jobs WHERE id = ?`),
@@ -159,8 +159,11 @@ export function openStore(file) {
     db,
     close: () => db.close(),
 
-    createJob({ printer, taskName = null, startTime = null, adopted = false, dryRun }) {
-      return Number(q.insertJob.run({ printer, taskName, startTime, adopted: bool(adopted), dryRun: bool(dryRun), createdAt: now() }).lastInsertRowid);
+    // startedAt: HA timestamp of the status change that started the job (print_weight must be newer)
+    createJob({ printer, taskName = null, startTime = null, startedAt = null, adopted = false, dryRun }) {
+      return Number(
+        q.insertJob.run({ printer, taskName, startTime, startedAt, adopted: bool(adopted), dryRun: bool(dryRun), createdAt: now() }).lastInsertRowid,
+      );
     },
     getJob: (id) => q.job.get(id),
     getActiveJob: (printer) => q.activeJob.get(printer),
@@ -240,6 +243,7 @@ function migrate(db) {
   db.transaction(() => {
     if (version < 1) db.exec(SCHEMA);
     if (version < 2) db.exec(`ALTER TABLE usage_log ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`);
+    if (version < 3) db.exec(`ALTER TABLE jobs ADD COLUMN started_at TEXT`);
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
   })();
 }

@@ -11,14 +11,21 @@ which spool each print used and deducts the grams when the print ends. The norma
 ## How it works
 
 1. **Print start** (`print_status` enters `prepare`/`running`). The bridge presses the printer's
-   *force refresh* button if it has one, waits a few seconds, then snapshots `print_weight`
-   (grams per source, e.g. `AMS 1 Tray 2` or `External Spool`) and resolves each source to a Spoolman
-   spool. The snapshot is stored in SQLite immediately, so swapping spools afterwards or restarting the
-   container doesn't break attribution. If `print_weight` is corrected before progress leaves 0, the
-   snapshot is taken again.
-2. **During the print** the highest `print_progress` is persisted on every increase.
+   *force refresh* button if it has one.
+   - It then snapshots `print_weight` (grams per source, e.g. `AMS 1 Tray 2` or `External Spool`)
+     and resolves each source to a Spoolman spool.
+   - At `prepare`, printers still report the previous print's `print_weight` and sometimes its
+     `print_progress` of 100. So the snapshot waits until `print_weight` is updated for this print
+     (usually with `running`). If it never changes, which happens when you reprint the same file,
+     the current value is used after 60 s.
+   - The snapshot is stored in SQLite immediately, so swapping spools afterwards or restarting the
+     container doesn't break attribution.
+   - If `print_weight` is corrected before the print reports any progress, the snapshot is taken again.
+2. **During the print** the highest `print_progress` is persisted on every increase. Only progress
+   reported after the print started counts, never a value left over from the previous print.
 3. **Print end**: `finish` deducts the full slicer estimate per source. `failed` (error or cancel)
-   deducts `grams × max progress / 100`. Every deduction goes to `usage_log`, which is the usage
+   deducts `grams × max progress / 100`. A print cancelled before it reported any progress deducts
+   nothing and touches no spool. Every deduction goes to `usage_log`, which is the usage
    history Spoolman itself doesn't keep.
 
 ### Finding the spool
@@ -39,7 +46,7 @@ which spool each print used and deducts the grams when the print ends. The norma
 - The spool's location is set to the slot, e.g. `P2S AMS1 Slot 3`, or `A1`.
 
 When a source can't be resolved, you get an **actionable notification** with the two best candidates
-and an *Open bridge* button. The deduction waits until you answer, and the answer survives restarts.
+and an *Open bridge* button. With `BRIDGE_URL` set, tapping the notification itself also opens the page. The deduction waits until you answer, and the answer survives restarts.
 The bridge page is LAN-only, so that link works only on your home network.
 
 ## Requirements
@@ -118,7 +125,7 @@ cp docker-compose.example.yml docker-compose.yml
 docker compose up -d
 ```
 
-Images are published to `ghcr.io/<github-user>/bambu-spoolman-bridge` (`latest`, version tags,
+Images are published to `ghcr.io/vandalpr/bambu-spoolman-bridge` (`latest`, version tags,
 `sha-…`) for `linux/amd64` and `linux/arm64`.
 
 ### Unraid
