@@ -1,0 +1,6 @@
+.env
+/data
+*.db
+# SQLite WAL side files (bridge.db-wal, bridge.db-shm)
+*.db-*
+node_modules

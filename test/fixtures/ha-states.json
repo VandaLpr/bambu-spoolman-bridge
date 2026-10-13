@@ -1,0 +1,225 @@
+{
+  "sensor.p2s_ams_1_tray_1": {
+    "state": "Bambu PLA Basic",
+    "attributes": {
+      "slot": 1,
+      "active": false,
+      "bed_temp": "0",
+      "color": "#E4BD68FF",
+      "cols": [
+        "#E4BD68FF"
+      ],
+      "ctype": 2,
+      "dry_temp": 0,
+      "dry_time": 0,
+      "empty": false,
+      "unknown": false,
+      "state": 11,
+      "filament_id": "GFA00",
+      "tray_weight": "1000",
+      "name": "Bambu PLA Basic",
+      "nozzle_temp_min": "190",
+      "nozzle_temp_max": "230",
+      "remain": 64,
+      "remain_enabled": true,
+      "tag_uid": "1111AAAA00000100",
+      "tray_uuid": "A1B2C3D4E5F60718293A4B5C6D7E8F90",
+      "type": "PLA",
+      "icon": "mdi:printer-3d-nozzle",
+      "friendly_name": "P2S_AMS_1 Tray 1"
+    }
+  },
+  "sensor.p2s_ams_1_tray_2": {
+    "state": "Bambu PLA Basic",
+    "attributes": {
+      "slot": 2,
+      "active": true,
+      "bed_temp": "0",
+      "color": "#000000FF",
+      "cols": [
+        "#000000FF"
+      ],
+      "ctype": 2,
+      "dry_temp": 0,
+      "dry_time": 0,
+      "empty": false,
+      "unknown": false,
+      "state": 27,
+      "filament_id": "GFA00",
+      "tray_weight": "1000",
+      "name": "Bambu PLA Basic",
+      "nozzle_temp_min": "190",
+      "nozzle_temp_max": "230",
+      "remain": 82,
+      "remain_enabled": true,
+      "tag_uid": "2222AAAA00000100",
+      "tray_uuid": "0F1E2D3C4B5A69788796A5B4C3D2E1F0",
+      "type": "PLA",
+      "icon": "mdi:printer-3d-nozzle",
+      "friendly_name": "P2S_AMS_1 Tray 2"
+    }
+  },
+  "sensor.p2s_ams_1_tray_3": {
+    "state": "Bambu PLA Matte",
+    "attributes": {
+      "slot": 3,
+      "active": false,
+      "bed_temp": "0",
+      "color": "#BB3D43FF",
+      "cols": [
+        "#BB3D43FF"
+      ],
+      "ctype": 2,
+      "dry_temp": 0,
+      "dry_time": 0,
+      "empty": false,
+      "unknown": false,
+      "state": 11,
+      "filament_id": "GFA01",
+      "tray_weight": "1000",
+      "name": "Bambu PLA Matte",
+      "nozzle_temp_min": "190",
+      "nozzle_temp_max": "230",
+      "remain": 77,
+      "remain_enabled": true,
+      "tag_uid": "3333AAAA00000100",
+      "tray_uuid": "1234ABCD5678EF901234ABCD5678EF90",
+      "type": "PLA",
+      "icon": "mdi:printer-3d-nozzle",
+      "friendly_name": "P2S_AMS_1 Tray 3"
+    }
+  },
+  "sensor.p2s_ams_1_tray_4": {
+    "state": "Bambu PLA Basic",
+    "attributes": {
+      "slot": 4,
+      "active": false,
+      "bed_temp": "0",
+      "color": "#F7E6DEFF",
+      "cols": [
+        "#F7E6DEFF"
+      ],
+      "ctype": 2,
+      "dry_temp": 0,
+      "dry_time": 0,
+      "empty": false,
+      "unknown": false,
+      "state": 11,
+      "filament_id": "GFA00",
+      "tray_weight": "1000",
+      "name": "Bambu PLA Basic",
+      "nozzle_temp_min": "190",
+      "nozzle_temp_max": "230",
+      "remain": 87,
+      "remain_enabled": true,
+      "tag_uid": "4444AAAA00000100",
+      "tray_uuid": "FEDCBA9876543210FEDCBA9876543210",
+      "type": "PLA",
+      "icon": "mdi:printer-3d-nozzle",
+      "friendly_name": "P2S_AMS_1 Tray 4"
+    }
+  },
+  "sensor.p2s_active_tray": {
+    "state": "Bambu PLA Basic",
+    "attributes": {
+      "ams_index": 0,
+      "bed_temp": "0",
+      "color": "#000000FF",
+      "cols": [
+        "#000000FF"
+      ],
+      "ctype": 2,
+      "dry_temp": 0,
+      "dry_time": 0,
+      "filament_id": "GFA00",
+      "tray_weight": "1000",
+      "name": "Bambu PLA Basic",
+      "nozzle_temp_min": "190",
+      "nozzle_temp_max": "230",
+      "remain": 82,
+      "remain_enabled": true,
+      "tag_uid": "2222AAAA00000100",
+      "tray_index": 1,
+      "tray_uuid": "0F1E2D3C4B5A69788796A5B4C3D2E1F0",
+      "type": "PLA",
+      "friendly_name": "P2S Active tray"
+    }
+  },
+  "sensor.p2s_externalspool_external_spool": {
+    "state": "?",
+    "attributes": {
+      "active": false,
+      "bed_temp": "0",
+      "color": "#00000000",
+      "cols": [
+        "#00000000"
+      ],
+      "ctype": 2,
+      "dry_temp": 0,
+      "dry_time": 0,
+      "empty": true,
+      "unknown": false,
+      "state": 8,
+      "filament_id": "",
+      "tray_weight": "0",
+      "name": "?",
+      "nozzle_temp_min": "0",
+      "nozzle_temp_max": "0",
+      "remain": -1,
+      "remain_enabled": false,
+      "tag_uid": "0000000000000000",
+      "tray_uuid": "00000000000000000000000000000000",
+      "type": "?",
+      "icon": "mdi:printer-3d-nozzle",
+      "friendly_name": "P2S_ExternalSpool External spool"
+    }
+  },
+  "sensor.a1_external_spool_external_spool": {
+    "state": "Bambu PETG Basic",
+    "attributes": {
+      "active": true,
+      "bed_temp": "0",
+      "color": "#FFFFFFFF",
+      "cols": [],
+      "ctype": 0,
+      "dry_temp": "0",
+      "dry_time": "0",
+      "empty": false,
+      "unknown": false,
+      "state": 8,
+      "filament_id": "GFG00",
+      "k_value": 0.03999999910593033,
+      "tray_weight": "0",
+      "name": "Bambu PETG Basic",
+      "nozzle_temp_min": "230",
+      "nozzle_temp_max": "270",
+      "remain": -1,
+      "remain_enabled": false,
+      "tag_uid": "0000000000000000",
+      "tray_uuid": "00000000000000000000000000000000",
+      "type": "PETG",
+      "icon": "mdi:printer-3d-nozzle",
+      "friendly_name": "A1 External spool External spool"
+    }
+  },
+  "sensor.p2s_print_weight": {
+    "state": "0.56",
+    "attributes": {
+      "state_class": "measurement",
+      "AMS 1 Tray 2": 0.56,
+      "unit_of_measurement": "g",
+      "device_class": "weight",
+      "friendly_name": "P2S Print weight"
+    }
+  },
+  "sensor.a1_print_weight": {
+    "state": "0.11",
+    "attributes": {
+      "state_class": "measurement",
+      "External Spool": 0.11,
+      "unit_of_measurement": "g",
+      "device_class": "weight",
+      "friendly_name": "A1 Print weight"
+    }
+  }
+}

@@ -1,0 +1,17 @@
+# Copy to docker-compose.yml, fill in .env (see .env.example), then: docker compose up -d
+services:
+  bambu-spoolman-bridge:
+    image: ghcr.io/<github-user>/bambu-spoolman-bridge:latest
+    container_name: bambu-spoolman-bridge
+    restart: unless-stopped
+    # Unraid: nobody:users, matching /mnt/user/appdata ownership. Elsewhere use your own uid:gid.
+    user: "99:100"
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+      TZ: Etc/UTC
+    ports:
+      - "8080:8080"
+    volumes:
+      - /mnt/user/appdata/bambu-spoolman-bridge:/data
