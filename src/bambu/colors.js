@@ -5,7 +5,7 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { normalizeHex } from '../color.js';
+import { normalizeHex, storedHex } from '../color.js';
 
 // bambulab/BambuStudio commit 804d93bb5d (2026-09-22). BAMBU_COLOR_REF overrides it.
 export const DEFAULT_COLOR_REF = '804d93bb5de142c48c0dabedba87736ea9553206';
@@ -29,6 +29,8 @@ function normalize(raw) {
     name: raw.fila_color_name?.en ?? null,
     hex: hexes[0] ?? null,
     hexes,
+    // as Spoolman should store them: alpha kept when not opaque (translucent and clear colours)
+    stored: (raw.fila_color || []).map(storedHex).filter(Boolean),
     kind,
     direction: hexes.length > 1 ? (DIRECTIONS[kind] ?? null) : null,
   };

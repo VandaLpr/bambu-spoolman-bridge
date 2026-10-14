@@ -71,15 +71,16 @@ export function createSpoolmanClient({ baseUrl, dryRun, log, timeoutMs = 10_000,
     listVendors: () => read('/vendor'),
     listFields: (entityType) => read(`/field/${entityType}`),
 
-    async searchCatalog(query) {
+    // max: stop after this many results (the pending page shows only the first few)
+    async searchCatalog(query, { max = CATALOG_PAGE * CATALOG_MAX_PAGES } = {}) {
       const all = [];
-      for (let page = 0; page < CATALOG_MAX_PAGES; page++) {
+      for (let page = 0; page < CATALOG_MAX_PAGES && all.length < max; page++) {
         const params = new URLSearchParams({ query, limit: String(CATALOG_PAGE), offset: String(page * CATALOG_PAGE) });
         const batch = await read(`/external/filament/search?${params}`);
         all.push(...batch);
         if (batch.length < CATALOG_PAGE) break;
       }
-      return all;
+      return all.slice(0, max);
     },
 
     createVendor: (params) => write('POST', '/vendor', params),

@@ -14,7 +14,7 @@
 //   { op: 'patchFilament', filamentId, patch }
 
 import { CREATED_COMMENT, findExistingFilament } from './catalog.js';
-import { deltaE, filamentColors, sameColors } from './color.js';
+import { deltaE, filamentColors, normalizeHex, sameColors } from './color.js';
 import { readExtra } from './spoolman/extra.js';
 
 const MAX_CANDIDATES = 5;
@@ -57,6 +57,7 @@ const pending = (reason, spools) => ({
  * @param {string} [p.now] ISO timestamp used for first_used
  * @param {object|null} [p.colorTable]  Bambu colour codes (bambu/colors.js); pairing by code needs it
  * @param {Set<number>} [p.estimatedSpoolIds] intake spools imported without a weighed remaining_weight
+ * @param {Map<string, number>} [p.aliases] remembered external-spool answers, aliasKey() -> filament id
  */
 export function resolveSource({
   identity,
@@ -67,8 +68,9 @@ export function resolveSource({
   now,
   colorTable = null,
   estimatedSpoolIds = new Set(),
+  aliases = new Map(),
 }) {
-  const ctx = { identity, location, inventory, now: now || new Date().toISOString(), nearestMaxDeltaE, colorTable, estimatedSpoolIds };
+  const ctx = { identity, location, inventory, now: now || new Date().toISOString(), nearestMaxDeltaE, colorTable, estimatedSpoolIds, aliases };
   ctx.loaded = new Set(loadedTrayUuids.map(upper).filter(Boolean));
   return identity.trayUuid ? resolveRfid(ctx) : resolveByFilament(ctx);
 }
@@ -169,7 +171,7 @@ function resolveRfid(ctx) {
       : {
           ...pickQuery(identity),
           colorCode: code,
-          ...(entry?.direction ? { colorHexes: entry.hexes, colorDirection: entry.direction } : {}),
+          ...(entry?.direction ? { colorHexes: entry.hexes, colorStores: entry.stored, colorDirection: entry.direction } : {}),
         },
     spool: {
       initial_weight: trayWeight ?? undefined,
@@ -243,8 +245,24 @@ export function choiceDecision({ spool, identity, location, now = new Date().toI
 export const choiceWrites = (args) => choiceDecision(args).writes;
 
 function pickQuery(identity) {
-  const { filamentId, colorHex, material, name, trayWeight, nozzleTempMin, nozzleTempMax } = identity;
-  return { filamentId, colorHex, material, name, trayWeight, nozzleTempMin, nozzleTempMax };
+  const { filamentId, colorHex, colorStore, material, name, trayWeight, nozzleTempMin, nozzleTempMax } = identity;
+  return { filamentId, colorHex, colorStore, material, name, trayWeight, nozzleTempMin, nozzleTempMax };
+}
+
+export const aliasKey = (filamentId, hex) => `${filamentId}|${normalizeHex(hex)}`;
+
+// Spools that can answer a question: available ones; for an RFID tray also unbound (the
+// tray's tag will be linked to it).
+export function usableSpools(spools, { forRfidTray = false } = {}) {
+  return spools.filter((s) => isAvailable(s) && (!forRfidTray || !isRfidBound(s)));
+}
+
+/**
+ * The spool to use when the user picked a filament: the one opened spool, else the oldest
+ * unopened one (FIFO). @returns {{ spool, firstUse } | { ambiguous: spool[] } | null}
+ */
+export function pickSpoolForFilament(spools, filamentId, { forRfidTray = false } = {}) {
+  return pickOpenedOrUnopened(usableSpools(spools, { forRfidTray }).filter((s) => s.filament?.id === filamentId));
 }
 
 // One spool from a set of equivalent candidates: the only opened one, or the
@@ -278,6 +296,15 @@ function resolveByFilament(ctx) {
   const exact = pickOpenedOrUnopened(eligible.filter((s) => matchesFilament(s, identity)));
   if (exact?.ambiguous) return pending('ambiguous_opened', exact.ambiguous);
   if (exact) return resolvedFromPick(ctx, exact, 'matched');
+
+  // A remembered answer: the user once said this reported (filament id, colour) is that
+  // filament. Used only while that filament has a usable spool.
+  const aliased = ctx.aliases.get(aliasKey(identity.filamentId, identity.colorHex));
+  if (aliased !== undefined) {
+    const pick = pickOpenedOrUnopened(eligible.filter((s) => s.filament?.id === aliased));
+    if (pick?.ambiguous) return pending('ambiguous_opened', pick.ambiguous);
+    if (pick) return resolvedFromPick(ctx, pick, 'alias');
+  }
 
   // Nearest color within the same filament id, only when exactly one filament is close enough.
   const sameId = identity.filamentId ? eligible.filter((s) => filamentIdOf(s) === identity.filamentId) : [];

@@ -5,7 +5,7 @@
 const ACTION = /^BSB_(\d+)_(\d+)$/;
 const MAX_BUTTONS = 2;
 
-const REASONS = {
+export const REASONS = {
   ambiguous_opened: 'several opened spools match',
   ambiguous_pairing: 'several opened spools could hold this RFID tag',
   ambiguous_pairing_color: 'several filaments have a close colour',

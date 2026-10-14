@@ -21,7 +21,7 @@
 
 import { computeDeductions, round2 } from './deduction.js';
 import { baselineFromHistory, decide, isSignificant, startTimeDiffers, TERMINAL } from './lifecycle.js';
-import { choiceDecision, resolveSource } from './resolver.js';
+import { choiceDecision, pickSpoolForFilament, resolveSource } from './resolver.js';
 import { activeTrayKey, formatLocation, identityFromTray, parsePrintWeight } from './sources.js';
 
 const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -519,6 +519,7 @@ export class PrinterTracker {
         now,
         colorTable: this.colorTable(),
         estimatedSpoolIds: this.store.estimatedSpoolIds(),
+        aliases: this.store.aliasMap(),
       });
       let { spoolId, resolution } = await this.executor.applyDecision(decision);
       // An answer given before a re-snapshot stays in force.
@@ -630,10 +631,15 @@ export function identityFromSourceRow(row) {
  * spoolId null = skip: nothing is deducted for this source.
  * @returns {{ ok: boolean, message: string }}
  */
-export async function resolvePending({ store, spoolman, executor, log, pendingId, spoolId }) {
+export async function resolvePending({ store, spoolman, executor, log, pendingId, spoolId = null, filamentId = null }) {
   const pending = store.getPending(pendingId);
   if (!pending) return { ok: false, message: `pending ${pendingId} not found` };
   if (pending.state !== 'open') return { ok: false, message: `pending ${pendingId} is already ${pending.state}` };
+  if (filamentId != null) {
+    const picked = await spoolForFilament({ spoolman, pending, filamentId });
+    if (!picked.spoolId) return picked;
+    spoolId = picked.spoolId;
+  }
   if (pending.kind === 'insert') return resolveInsertPending({ store, spoolman, executor, log, pending, spoolId });
   const usage = store.getUsageFor(pending.job_id, pending.source_key);
 
@@ -658,12 +664,28 @@ export async function resolvePending({ store, spoolman, executor, log, pendingId
   // The same spool may also have been asked about when it was inserted: that's answered now.
   const inserted = source.tray_uuid ? store.getInsertPending(source.tray_uuid) : null;
   if (inserted?.state === 'open') store.closePending(inserted.id, 'resolved', spoolId);
+  // External spool: remember the answer for what the printer reported (filament id, colour).
+  if (!source.tray_uuid && source.filament_id && source.color_hex && spool.filament?.id) {
+    store.setAlias({ reportedFilamentId: source.filament_id, reportedColorHex: source.color_hex, filamentId: spool.filament.id });
+    log.info(`alias: printer ${source.filament_id} #${source.color_hex} -> filament #${spool.filament.id}`);
+  }
   if (usage?.write_state === 'parked') {
     store.setUsageState(usage.id, 'queued', { spoolId });
     await executor.processQueue();
   }
   log.info(`pending ${pendingId} resolved: ${pending.source_key} of job ${pending.job_id} -> spool #${spoolId}`);
   return { ok: true, message: usage ? `Spool #${spoolId} chosen; ${usage.grams} g deducted.` : `Spool #${spoolId} chosen; it will be deducted when the print ends.` };
+}
+
+// The user picked a filament: the one opened spool, else the oldest unopened one. Several
+// opened spools -> they pick the spool (chooseSpool). An RFID tray needs an unbound spool.
+async function spoolForFilament({ spoolman, pending, filamentId }) {
+  const pick = pickSpoolForFilament(await spoolman.listSpools(), filamentId, { forRfidTray: Boolean(pending.tray_uuid) });
+  if (!pick) return { ok: false, message: `Filament #${filamentId} has no spool that can be used here.` };
+  if (pick.ambiguous) {
+    return { ok: false, chooseSpool: pick.ambiguous.map((sp) => sp.id), message: 'Several opened spools of this filament: which one?' };
+  }
+  return { spoolId: pick.spool.id };
 }
 
 // Answer to "which spool did you just insert?": pair the tray with it (no deduction), then

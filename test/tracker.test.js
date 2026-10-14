@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createColorTable } from '../src/bambu/colors.js';
 import { createExecutor } from '../src/executor.js';
 import { resolveEntities } from '../src/ha/entities.js';
+import { identityFromTray } from '../src/sources.js';
 import { readExtra } from '../src/spoolman/extra.js';
 import { openStore } from '../src/store.js';
 import { PrinterTracker, resolvePending } from '../src/tracker.js';
@@ -893,5 +894,99 @@ describe('questions at insert time', () => {
     await r.start();
     await r.push({ 'sensor.p2s_ams_1_tray_3': inserted });
     assert.equal(r.notifier.sent.pending.length, 1);
+  });
+});
+
+describe('answers by filament and remembered external-spool answers', () => {
+  // A1 reports Generic PETG black (GFG99 #000000); Spoolman has Acme PETG "Black" with a slightly
+  // different hex under another id, and an Acme PETG Grey: nothing matches exactly or uniquely.
+  const acmeBlack = { ...filament({ id: 70, name: 'Black', material: 'PETG', colorHex: '1C1C1C', bambuId: 'GFG98' }), vendor: { id: 7, name: 'Acme' } };
+  const acmeGrey = { ...filament({ id: 71, name: 'Grey', material: 'PETG', colorHex: '7F7F7F', bambuId: 'GFG98' }), vendor: { id: 7, name: 'Acme' } };
+  const genericPetgBlack = { ...a1External, filament_id: 'GFG99', name: 'Generic PETG', type: 'PETG', color: '#000000FF', cols: [] };
+  const world = { 'sensor.a1_external_spool_external_spool': { state: 'Generic PETG', attributes: genericPetgBlack } };
+  const a1Rig = (spools) => rig({ printer: A1, spools, filaments: [acmeBlack, acmeGrey], initial: world });
+  const answer = (r, pendingId, given) => resolvePending({ store, spoolman: r.spoolman, executor: r.executor, log: silentLog, pendingId, ...given });
+  const print = async (r, startTime) => {
+    await r.push({ status: 'prepare', progress: '0', startTime, taskName: 'Test print', printWeight: pw({ 'External Spool': 4 }) });
+    await r.push({ status: 'running', progress: '10' });
+  };
+
+  test('choosing a filament: its one opened spool is used, and the answer is remembered', async () => {
+    const r = a1Rig([spool({ id: 72, filament: acmeBlack, firstUsed: T1 }), spool({ id: 73, filament: acmeBlack }), spool({ id: 74, filament: acmeGrey, firstUsed: T1 })]);
+    await r.start();
+    await print(r, T1);
+    const { pending } = r.notifier.sent.pending[0];
+    const result = await answer(r, pending.id, { filamentId: 70 });
+    assert.equal(result.ok, true);
+    assert.equal(store.getPending(pending.id).chosen_spool_id, 72);
+    assert.deepEqual(store.listAliases().map((a) => [a.reported_filament_id, a.reported_color_hex, a.filament_id]), [['GFG99', '000000', 70]]);
+    await r.push({ status: 'finish', progress: '100' });
+    assert.deepEqual(r.usage(), [['External Spool', 72, 4, 'applied']]);
+
+    // next print with the same printer selection: no question, the alias resolves it
+    await print(r, '2026-10-12T23:30:00+00:00');
+    assert.equal(r.notifier.sent.pending.length, 1);
+    const job = store.listJobs()[0];
+    assert.deepEqual(store.getJobSources(job.id).map((s) => [s.spool_id, s.resolution]), [[72, 'alias']]);
+  });
+
+  test('choosing a filament without an opened spool opens the oldest one (FIFO)', async () => {
+    const r = a1Rig([spool({ id: 76, filament: acmeBlack }), spool({ id: 75, filament: acmeBlack }), spool({ id: 74, filament: acmeGrey, firstUsed: T1 })]);
+    await r.start();
+    await print(r, T1);
+    await answer(r, r.notifier.sent.pending[0].pending.id, { filamentId: 70 });
+    assert.ok(r.spoolById(75).first_used);
+    assert.equal(r.spoolById(76).first_used, null);
+  });
+
+  test('a filament with several opened spools asks for the spool; nothing is decided yet', async () => {
+    const r = a1Rig([spool({ id: 72, filament: acmeBlack, firstUsed: T1 }), spool({ id: 73, filament: acmeBlack, firstUsed: T1 })]);
+    await r.start();
+    await print(r, T1);
+    const { pending } = r.notifier.sent.pending[0];
+    const result = await answer(r, pending.id, { filamentId: 70 });
+    assert.deepEqual([result.ok, result.chooseSpool], [false, [72, 73]]);
+    assert.equal(store.getPending(pending.id).state, 'open');
+    assert.deepEqual(store.listAliases(), []);
+    await answer(r, pending.id, { spoolId: 73 }); // step 2
+    assert.equal(store.listAliases()[0].filament_id, 70);
+  });
+
+  test('answering with a spool (notification button) also remembers; a new answer replaces it', async () => {
+    const r = a1Rig([spool({ id: 72, filament: acmeBlack, firstUsed: T1 }), spool({ id: 74, filament: acmeGrey, firstUsed: T1 })]);
+    await r.start();
+    await print(r, T1);
+    await answer(r, r.notifier.sent.pending[0].pending.id, { spoolId: 74 });
+    assert.equal(store.aliasMap().get('GFG99|000000'), 71);
+    await r.push({ status: 'finish', progress: '100' });
+
+    // the user removes the alias (as on the page) and answers differently next time
+    store.deleteAlias('GFG99', '000000');
+    await print(r, '2026-10-12T23:30:00+00:00');
+    await answer(r, r.notifier.sent.pending.at(-1).pending.id, { spoolId: 72 });
+    assert.deepEqual(store.listAliases().map((a) => a.filament_id), [70]);
+    store.setAlias({ reportedFilamentId: 'GFG99', reportedColorHex: '000000', filamentId: 71 }); // replace
+    assert.deepEqual(store.listAliases().map((a) => a.filament_id), [71]);
+  });
+
+  test('RFID answers never create aliases', async () => {
+    const r = rig({ printer: P2S }); // 63% fixture inventory
+    await r.start();
+    const { pending } = store.addInsertPending({
+      printer: 'p2s', sourceKey: 'AMS 1 Tray 3', trayUuid: uuid(3), reason: 'ambiguous_pairing', candidates: [],
+      context: { identity: identityFromTray(tray(3)), location: 'P2S AMS1 Slot 3' },
+    });
+    await answer(r, pending.id, { spoolId: 3 });
+    assert.deepEqual(store.listAliases(), []);
+
+    // a print question about an RFID tray: the tag pairs it, no alias either
+    const jobId = store.createJob({ printer: 'p2s', taskName: 'Test print', dryRun: false });
+    store.replaceJobSources(jobId, [
+      { sourceKey: 'AMS 1 Tray 2', grams: 1, kind: 'ams', unit: 1, slot: 2, trayUuid: uuid(2), filamentId: 'GFA00', colorHex: '000000', location: 'P2S AMS1 Slot 2' },
+    ]);
+    const printQuestion = store.upsertPending({ jobId, sourceKey: 'AMS 1 Tray 2', reason: 'ambiguous_pairing', candidates: [], printer: 'p2s', trayUuid: uuid(2) });
+    await answer(r, printQuestion.id, { spoolId: 2 });
+    assert.equal(store.getPending(printQuestion.id).state, 'resolved');
+    assert.deepEqual(store.listAliases(), []);
   });
 });

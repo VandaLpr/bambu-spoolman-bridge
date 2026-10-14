@@ -10,10 +10,12 @@ import { addSecret, createLogger, setLogLevel } from './log.js';
 import { createNotifier, parseAction } from './notifier.js';
 import { createApp } from './server.js';
 import { loadColorTable } from './bambu/colors.js';
+import { restoreAlpha } from './maintenance.js';
 import { createIntake } from './intake.js';
 import { createSpoolmanClient } from './spoolman/client.js';
 import { openStore } from './store.js';
 import { PrinterTracker, resolvePending } from './tracker.js';
+import { reportedFor } from './choices.js';
 
 const REQUIRED_FIELDS = { spool: ['rfid_uuid'], filament: ['bambu_filament_id', 'bambu_color_code'] };
 const { version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -42,6 +44,10 @@ async function main() {
   // Intake is user-initiated: it always writes, whatever DRY_RUN says.
   const intakeSpoolman = createSpoolmanClient({ baseUrl: config.spoolmanUrl, dryRun: false, log: createLogger('intake') });
   const colorTable = await loadColorTable({ ref: config.bambuColorRef, dataDir: config.dataDir, log: createLogger('bambu') });
+  // One-time: restore the alpha of translucent colours imported before it was kept.
+  await restoreAlpha({ store, spoolman: intakeSpoolman, colorTable, log: createLogger('maintenance') }).catch((e) =>
+    log.warn(`alpha correction failed, retried at the next start: ${e.message}`),
+  );
   const status = { spoolmanOk: false, entitiesOk: false, startedAt: new Date().toISOString() };
 
   try {
@@ -66,7 +72,9 @@ async function main() {
   if (!services.notify?.[notifyName]) log.error(`notify service ${config.notifyService} not found in Home Assistant`);
   if (!config.bridgeUrl) log.warn('BRIDGE_URL is not set; pending notifications get no "Open bridge" button');
 
-  const answer = (pendingId, spoolId) => resolvePending({ store, spoolman, executor, log, pendingId, spoolId });
+  // answer: { spoolId } or { filamentId }; neither = skip
+  const answer = (pendingId, { spoolId = null, filamentId = null } = {}) =>
+    resolvePending({ store, spoolman, executor, log, pendingId, spoolId, filamentId });
   const trackers = [];
   const loadedTrayUuids = () => trackers.flatMap((t) => t.trayAttributes().map((a) => a.tray_uuid)).filter(Boolean);
 
@@ -113,7 +121,7 @@ async function main() {
       log.info(`[DRY RUN] notification answer logged only: pending ${parsed.pendingId} -> spool #${parsed.spoolId}`);
       return;
     }
-    const result = await answer(parsed.pendingId, parsed.spoolId);
+    const result = await answer(parsed.pendingId, { spoolId: parsed.spoolId });
     log.info(`notification answer: ${result.message}`);
   });
 
@@ -123,17 +131,45 @@ async function main() {
   );
 
   const intake = createIntake({ spoolman: intakeSpoolman, store, colorTable: () => colorTable, config, log: createLogger('intake') });
+  // Answers from the bridge page: logged only in DRY_RUN, like notification answers.
+  const pageAnswer = async (pendingId, given) => {
+    if (config.dryRun) {
+      const what = given.spoolId != null ? `spool #${given.spoolId}` : given.filamentId != null ? `filament #${given.filamentId}` : 'skip';
+      log.info(`[DRY RUN] bridge page answer logged only: pending ${pendingId} -> ${what}`);
+      return { ok: true, message: 'DRY_RUN: answer logged only, nothing changed.' };
+    }
+    return answer(pendingId, given);
+  };
   const app = createApp({
     intake,
     store,
     dryRun: config.dryRun,
-    resolvePending: async (pendingId, spoolId) => {
-      if (config.dryRun) {
-        log.info(`[DRY RUN] bridge page answer logged only: pending ${pendingId} -> ${spoolId == null ? 'skip' : `spool #${spoolId}`}`);
-        return { ok: true, message: 'DRY_RUN: answer logged only, nothing changed.' };
-      }
-      return answer(pendingId, spoolId);
+    resolvePending: pageAnswer,
+    choices: {
+      inventory: async () => {
+        const [filaments, spools] = await Promise.all([spoolman.listFilaments(), spoolman.listSpools()]);
+        return { filaments, spools };
+      },
+      search: (q) => spoolman.searchCatalog(q, { max: 20 }),
+      colorTable: () => colorTable,
+      // User-initiated like intake: the spool is created even in DRY_RUN; the answer follows the usual rule.
+      addFromCatalog: async ({ pendingId, externalId, q }) => {
+        const pending = store.getPending(pendingId);
+        if (!pending || pending.state !== 'open') return { ok: false, message: `Question ${pendingId} is not open.` };
+        const added = await intake.addCatalogSpool({ query: q, externalId, bambuFilamentId: reportedFor(store, pending, colorTable).filamentId });
+        const result = await pageAnswer(pendingId, { spoolId: added.spoolId });
+        return { ok: result.ok, message: `Spool #${added.spoolId} (${added.filamentName}) added to Spoolman. ${result.message}` };
+      },
+      // "+ New spool" of a filament without a free spool; created even in DRY_RUN, like intake.
+      newSpool: async ({ pendingId, filamentId }) => {
+        const pending = store.getPending(pendingId);
+        if (!pending || pending.state !== 'open') return { ok: false, message: `Question ${pendingId} is not open.` };
+        const added = await intake.addFilamentSpool({ filamentId });
+        const result = await pageAnswer(pendingId, { spoolId: added.spoolId });
+        return { ok: result.ok, message: `New spool #${added.spoolId} of ${added.filamentName} added to Spoolman. ${result.message}` };
+      },
     },
+    nearestMaxDeltaE: config.nearestColorMaxDeltaE,
     requeueUsage: async (usageId, spoolId) => {
       if (config.dryRun) {
         log.info(`[DRY RUN] re-queue answer logged only: deduction ${usageId} -> ${spoolId == null ? 'skip' : `spool #${spoolId}`}`);

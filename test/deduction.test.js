@@ -68,6 +68,7 @@ test('identityFromTray reads an RFID tray', () => {
     filamentId: 'GFA00',
     colorHex: 'E4BD68',
     colorHexes: ['E4BD68'],
+    colorStore: 'E4BD68',
     material: 'PLA',
     name: 'Bambu PLA Basic',
     remainPct: 64,

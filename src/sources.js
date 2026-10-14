@@ -1,6 +1,6 @@
 // Pure parsing of ha-bambulab entity data into filament sources and spool identities.
 
-import { normalizeHex } from './color.js';
+import { normalizeHex, storedHex } from './color.js';
 
 const AMS_KEY = /^AMS (\d+) Tray (\d+)$/;
 const EXTERNAL_KEY = /^External Spool$/i;
@@ -51,6 +51,8 @@ export function identityFromTray(attributes = {}) {
     colorHex: normalizeHex(attributes.color),
     // every colour of a multi-colour spool (ha-bambulab's cols); one entry otherwise
     colorHexes: (attributes.cols || []).map(normalizeHex).filter(Boolean),
+    // as Spoolman should store it (alpha kept for translucent spools)
+    colorStore: storedHex(attributes.color),
     material,
     name: attributes.name && attributes.name !== '?' ? attributes.name : null,
     remainPct: attributes.remain_enabled && remain >= 0 ? remain : null,

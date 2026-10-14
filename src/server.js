@@ -1,17 +1,31 @@
-// HTTP API for inspection, pending sources and rejected deductions. LAN only, no auth.
+// HTTP API for inspection, pending questions, rejected deductions and intake. LAN only, no auth.
 // createApp() returns the Express app so more routers (e.g. MCP in phase 2) can be mounted.
 
 import { fileURLToPath } from 'node:url';
 import express from 'express';
+import { localFilamentForEntry } from './catalog.js';
+import { filamentChoices, reportedFor, spoolChoices } from './choices.js';
 import { IntakeError } from './intake.js';
+import { page, pendingPage, usagePage } from './pages.js';
 
 const ASSETS = fileURLToPath(new URL('../assets/', import.meta.url));
-
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+const SEARCH_RESULTS = 20;
 
 const limitOf = (req, def) => Math.min(Math.max(Number.parseInt(req.query.limit, 10) || def, 1), 500);
+const int = (v) => {
+  const n = Number.parseInt(v, 10);
+  return Number.isInteger(n) ? n : null;
+};
+const isForm = (req) => req.is('application/x-www-form-urlencoded');
+const notFound = (res, what) => res.status(404).type('html').send(page('Not found', `<p>This ${what} does not exist.</p>`));
 
-export function createApp({ store, health, resolvePending, requeueUsage, intake, dryRun }) {
+/**
+ * @param {object} deps
+ * @param {Function} deps.resolvePending  (pendingId, { spoolId?, filamentId? }) -> { ok, message, chooseSpool? }
+ * @param {object} deps.choices  { inventory(), search(q), colorTable(), addFromCatalog({ pendingId, externalId, q }),
+ *   newSpool({ pendingId, filamentId }) }
+ */
+export function createApp({ store, health, resolvePending, requeueUsage, intake, choices, dryRun, nearestMaxDeltaE = 20 }) {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
   app.use(express.urlencoded({ extended: false }));
@@ -38,35 +52,140 @@ export function createApp({ store, health, resolvePending, requeueUsage, intake,
 
   app.get('/pending', (req, res) => res.json(store.listPending(req.query.state || 'open')));
 
-  app.get('/pending/:id', (req, res) => {
-    const pending = store.getPending(Number(req.params.id));
-    if (!pending) return res.status(404).type('html').send(page('Not found', '<p>This pending item does not exist.</p>'));
-    res.type('html').send(pendingPage({ pending, job: store.getJob(pending.job_id), dryRun, notice: req.query.msg }));
+  // Step 1: choose a filament (or search SpoolmanDB, or type a spool id). Step 2 (?filament=)
+  // only when that filament has several opened spools.
+  app.get('/pending/:id', async (req, res, next) => {
+    try {
+      const pending = store.getPending(Number(req.params.id));
+      if (!pending) return notFound(res, 'question');
+      const colorTable = choices.colorTable?.() ?? null;
+      const view = { pending, job: pending.job_id ? store.getJob(pending.job_id) : null, reported: reportedFor(store, pending, colorTable), dryRun, notice: req.query.msg };
+      if (pending.state !== 'open') return res.type('html').send(pendingPage(view));
+      let inventory = null;
+      try {
+        inventory = await choices.inventory();
+      } catch (e) {
+        view.error = `Spoolman is unreachable (${e.message}); only a spool id can be entered.`;
+      }
+      const filamentId = int(req.query.filament);
+      if (inventory && filamentId !== null) {
+        const filament = inventory.filaments.find((f) => f.id === filamentId);
+        if (filament) {
+          const listed = filamentChoices({ filaments: [filament], spools: inventory.spools, reported: view.reported });
+          const v = listed.suggested[0] ?? listed.groups[0]?.filaments[0] ?? { name: filament.name, colors: [], direction: null };
+          view.step2 = { filament: v, spools: spoolChoices({ spools: inventory.spools, filamentId, reported: view.reported }) };
+        }
+      }
+      const q = String(req.query.q ?? '').trim();
+      if (q && !view.step2) {
+        try {
+          view.search = { q, results: (await choices.search(q)).slice(0, SEARCH_RESULTS) };
+        } catch (e) {
+          view.error = `SpoolmanDB search failed: ${e.message}`;
+        }
+      }
+      if (inventory && !view.step2) {
+        // A search hit that is already in the inventory links to that filament's row instead.
+        const alsoShow = new Set();
+        for (const e of view.search?.results ?? []) {
+          const { filament } = localFilamentForEntry(inventory.filaments, e, { bambuFilamentId: view.reported.filamentId, colorTable });
+          if (filament) {
+            e.inInventory = { id: filament.id, name: filament.name };
+            alsoShow.add(filament.id);
+          }
+        }
+        view.choices = filamentChoices({ ...inventory, reported: view.reported, aliases: store.listAliases(), maxDeltaE: nearestMaxDeltaE, alsoShow });
+      }
+      res.type('html').send(pendingPage(view));
+    } catch (e) {
+      next(e);
+    }
   });
 
-  app.get('/usage/:id', (req, res) => {
-    const row = store.getUsage(Number(req.params.id));
-    if (!row) return res.status(404).type('html').send(page('Not found', '<p>This deduction does not exist.</p>'));
-    res.type('html').send(usagePage({ row, job: store.getJob(row.job_id), dryRun, notice: req.query.msg }));
-  });
-
-  // Body: { spoolId: 12 } or { skip: true }. HTML forms get a redirect back to the page.
-  const answerRoute = (pagePath, handler) => async (req, res, next) => {
+  // Body: { filamentId } | { spoolId } | { skip: true }. HTML forms get a redirect back.
+  app.post('/pending/:id/resolve', async (req, res, next) => {
     try {
       const id = Number(req.params.id);
       const skip = req.body.skip === true || req.body.skip === 'true';
-      const spoolId = skip ? null : Number.parseInt(req.body.spoolId, 10);
-      if (!skip && !Number.isInteger(spoolId)) return res.status(400).json({ ok: false, message: 'spoolId or skip is required' });
-      const result = await handler(id, spoolId);
-      if (req.is('application/x-www-form-urlencoded')) return res.redirect(303, `${pagePath}/${id}?msg=${encodeURIComponent(result.message)}`);
+      const answer = { spoolId: int(req.body.spoolId), filamentId: int(req.body.filamentId) };
+      if (!skip && answer.spoolId === null && answer.filamentId === null) {
+        return res.status(400).json({ ok: false, message: 'filamentId, spoolId or skip is required' });
+      }
+      const result = await resolvePending(id, skip ? {} : answer);
+      if (isForm(req)) {
+        const step2 = result.chooseSpool ? `&filament=${answer.filamentId}` : '';
+        return res.redirect(303, `/pending/${id}?msg=${encodeURIComponent(result.message)}${step2}`);
+      }
       res.status(result.ok ? 200 : 409).json(result);
     } catch (e) {
       next(e);
     }
-  };
-  app.post('/pending/:id/resolve', answerRoute('/pending', resolvePending));
-  // Only for rows in needs_attention (Spoolman rejected the deduction).
-  app.post('/usage/:id/requeue', answerRoute('/usage', requeueUsage));
+  });
+
+  // "Add from SpoolmanDB": one new spool of that entry, used to answer the question.
+  app.post('/pending/:id/add', async (req, res, next) => {
+    const id = Number(req.params.id);
+    try {
+      const externalId = String(req.body.externalId ?? '');
+      const q = String(req.body.q ?? '');
+      if (!externalId || !q) return res.status(400).json({ ok: false, message: 'externalId and q are required' });
+      const result = await choices.addFromCatalog({ pendingId: id, externalId, q });
+      if (isForm(req)) return res.redirect(303, `/pending/${id}?msg=${encodeURIComponent(result.message)}`);
+      res.status(result.ok ? 200 : 409).json(result);
+    } catch (e) {
+      if (!(e instanceof IntakeError)) return next(e);
+      if (isForm(req)) return res.redirect(303, `/pending/${id}?msg=${encodeURIComponent(e.message)}`);
+      res.status(e.status).json({ ok: false, message: e.message });
+    }
+  });
+
+  // "+ New spool" of a filament that has no free spool (used up, or all tied to other tags).
+  app.post('/pending/:id/new-spool', async (req, res, next) => {
+    const id = Number(req.params.id);
+    try {
+      const filamentId = int(req.body.filamentId);
+      if (filamentId === null) return res.status(400).json({ ok: false, message: 'filamentId is required' });
+      const result = await choices.newSpool({ pendingId: id, filamentId });
+      if (isForm(req)) return res.redirect(303, `/pending/${id}?msg=${encodeURIComponent(result.message)}`);
+      res.status(result.ok ? 200 : 409).json(result);
+    } catch (e) {
+      if (!(e instanceof IntakeError)) return next(e);
+      if (isForm(req)) return res.redirect(303, `/pending/${id}?msg=${encodeURIComponent(e.message)}`);
+      res.status(e.status).json({ ok: false, message: e.message });
+    }
+  });
+
+  // Remembered external-spool answers: printer-reported (filament id, colour) -> filament.
+  app.get('/aliases', (req, res) => res.json(store.listAliases()));
+  app.post('/aliases/remove', (req, res) => {
+    const removed = store.deleteAlias(String(req.body.reported_filament_id ?? ''), String(req.body.reported_color_hex ?? ''));
+    const back = String(req.body.back ?? '');
+    if (isForm(req) && /^\/pending\/\d+$/.test(back)) {
+      return res.redirect(303, `${back}?msg=${encodeURIComponent(removed ? 'Printer alias removed.' : 'That alias was already gone.')}`);
+    }
+    res.status(removed ? 200 : 404).json({ ok: removed });
+  });
+
+  app.get('/usage/:id', (req, res) => {
+    const row = store.getUsage(Number(req.params.id));
+    if (!row) return notFound(res, 'deduction');
+    res.type('html').send(usagePage({ row, job: store.getJob(row.job_id), dryRun, notice: req.query.msg }));
+  });
+
+  // Only for rows in needs_attention (Spoolman rejected the deduction). Body: { spoolId } | { skip: true }
+  app.post('/usage/:id/requeue', async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const skip = req.body.skip === true || req.body.skip === 'true';
+      const spoolId = skip ? null : int(req.body.spoolId);
+      if (!skip && spoolId === null) return res.status(400).json({ ok: false, message: 'spoolId or skip is required' });
+      const result = await requeueUsage(id, spoolId);
+      if (isForm(req)) return res.redirect(303, `/usage/${id}?msg=${encodeURIComponent(result.message)}`);
+      res.status(result.ok ? 200 : 409).json(result);
+    } catch (e) {
+      next(e);
+    }
+  });
 
   // Body: { batch_id, apply: false|true, items: [...] }. Independent of DRY_RUN.
   // 200 plan or result, 400 bad request, 409 batch_id reused for other items,
@@ -83,53 +202,4 @@ export function createApp({ store, health, resolvePending, requeueUsage, intake,
 
   app.use((err, req, res, _next) => res.status(500).json({ ok: false, message: err.message }));
   return app;
-}
-
-function page(title, body) {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${esc(title)}</title>
-<link rel="icon" href="/assets/icon.svg" type="image/svg+xml"><link rel="icon" href="/assets/icon.png" type="image/png" sizes="512x512">
-<link rel="apple-touch-icon" href="/assets/icon.png"><style>
-body{font:16px/1.4 system-ui,sans-serif;max-width:32rem;margin:1rem auto;padding:0 1rem;color:#222;background:#fafafa}
-button{display:block;width:100%;padding:.8rem;margin:.4rem 0;font-size:1rem;border:1px solid #888;border-radius:.4rem;background:#fff;text-align:left}
-.note{padding:.6rem;border-radius:.4rem;background:#fff3cd}.done{background:#d1e7dd}input{padding:.6rem;font-size:1rem;width:8rem}
-@media(prefers-color-scheme:dark){body{background:#121212;color:#ddd}button{background:#1e1e1e;color:#ddd}.note{background:#4d3d00}.done{background:#173d2a}}
-</style></head><body>${body}</body></html>`;
-}
-
-function pendingPage({ pending, job, dryRun, notice }) {
-  const open = pending.state === 'open';
-  const parts = [
-    `<h1>Which spool?</h1>`,
-    `<p>${esc(job?.printer ?? pending.printer)} · ${pending.kind === 'insert' ? 'spool just inserted' : esc(job?.task_name ?? 'unknown print')} · ${esc(pending.source_key)}<br>Reason: ${esc(pending.reason)}</p>`,
-  ];
-  if (dryRun) parts.push('<p class="note">DRY_RUN is on: answers are logged only.</p>');
-  if (notice) parts.push(`<p class="note">${esc(notice)}</p>`);
-  if (!open) {
-    parts.push(`<p class="note done">Already ${esc(pending.state)}${pending.chosen_spool_id ? `: spool #${esc(pending.chosen_spool_id)}` : ''}.</p>`);
-    return page('Pending', parts.join('\n'));
-  }
-  const form = (fields, label) =>
-    `<form method="post" action="/pending/${pending.id}/resolve">${fields}<button type="submit">${label}</button></form>`;
-  for (const c of pending.candidates) parts.push(form(`<input type="hidden" name="spoolId" value="${esc(c.spoolId)}">`, esc(c.label)));
-  parts.push(form('<label>Other spool id <input name="spoolId" inputmode="numeric" required></label>', 'Use this spool'));
-  parts.push(form('<input type="hidden" name="skip" value="true">', 'Skip: deduct nothing for this source'));
-  return page('Pending', parts.join('\n'));
-}
-
-function usagePage({ row, job, dryRun, notice }) {
-  const parts = [
-    `<h1>Deduction ${esc(row.id)}</h1>`,
-    `<p>${esc(job?.printer)} · ${esc(row.task_name ?? 'unknown print')} · ${esc(row.source_key)}<br>` +
-      `${esc(row.grams)} g from spool #${esc(row.spool_id ?? '?')} · state: ${esc(row.write_state)} · attempts: ${esc(row.attempts)}</p>`,
-  ];
-  if (row.error) parts.push(`<p class="note">Last error: ${esc(row.error)}</p>`);
-  if (dryRun) parts.push('<p class="note">DRY_RUN is on: answers are logged only.</p>');
-  if (notice) parts.push(`<p class="note">${esc(notice)}</p>`);
-  if (row.write_state !== 'needs_attention') return page('Deduction', parts.join('\n'));
-  const form = (fields, label) => `<form method="post" action="/usage/${row.id}/requeue">${fields}<button type="submit">${label}</button></form>`;
-  if (row.spool_id) parts.push(form(`<input type="hidden" name="spoolId" value="${esc(row.spool_id)}">`, `Retry spool #${esc(row.spool_id)}`));
-  parts.push(form('<label>Other spool id <input name="spoolId" inputmode="numeric" required></label>', 'Deduct from this spool'));
-  parts.push(form('<input type="hidden" name="skip" value="true">', 'Skip: deduct nothing'));
-  return page('Deduction', parts.join('\n'));
 }

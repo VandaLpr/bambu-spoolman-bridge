@@ -1,5 +1,7 @@
-// Color helpers. HA reports "#E4BD68FF" (RGBA), Spoolman stores "E4BD68".
+// Color helpers. HA and BambuStudio report "#E4BD68FF" (RGBA); Spoolman stores "E4BD68", or
+// 8 digits with alpha for translucent colours ("C9A38180"). Matching always compares RGB.
 
+// RGB only, for matching: "#C9A38180" -> "C9A381"
 export function normalizeHex(value) {
   if (typeof value !== 'string') return null;
   const hex = value.trim().replace(/^#/, '').toUpperCase();
@@ -30,6 +32,21 @@ export function deltaE(a, b) {
 }
 
 // A Spoolman filament's colours: color_hex, or multi_color_hexes for a multi-colour filament.
+// For storing in Spoolman: RGB when opaque, RGBA when the alpha isn't FF ("#C9A38180" -> "C9A38180").
+export function storedHex(value) {
+  if (typeof value !== 'string') return null;
+  const hex = value.trim().replace(/^#/, '').toUpperCase();
+  if (!/^[0-9A-F]{6}([0-9A-F]{2})?$/.test(hex)) return null;
+  return hex.length === 8 && !hex.endsWith('FF') ? hex : hex.slice(0, 6);
+}
+
+// A filament's colours as stored (with alpha), for checking whether they need an update.
+export function filamentStoredColors(filament) {
+  if (filament?.multi_color_hexes) return filament.multi_color_hexes.split(',').map(storedHex).filter(Boolean);
+  const hex = storedHex(filament?.color_hex);
+  return hex ? [hex] : [];
+}
+
 export function filamentColors(filament) {
   if (filament?.multi_color_hexes) return filament.multi_color_hexes.split(',').map(normalizeHex).filter(Boolean);
   const hex = normalizeHex(filament?.color_hex);

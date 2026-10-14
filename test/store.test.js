@@ -71,7 +71,7 @@ test('updateJobMeta keeps known values when HA reports unknown', () => {
   assert.equal(job.start_time, '2026-10-12T22:18:59+00:00');
 });
 
-test('a v1 database is migrated to v6: attempts, started_at, stage tracking, intake, pending kinds', async () => {
+test('a v1 database is migrated to v8: attempts, started_at, stage tracking, intake, pending kinds, aliases, meta', async () => {
   const { mkdtempSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -82,6 +82,8 @@ test('a v1 database is migrated to v6: attempts, started_at, stage tracking, int
   v2.db.exec('ALTER TABLE jobs DROP COLUMN started_at');
   v2.db.exec('ALTER TABLE jobs DROP COLUMN stage_tracked');
   v2.db.exec('ALTER TABLE jobs DROP COLUMN print_baseline');
+  v2.db.exec('DROP TABLE meta');
+  v2.db.exec('DROP TABLE filament_aliases');
   v2.db.exec('DROP INDEX pending_insert_tray');
   for (const c of ['kind', 'printer', 'tray_uuid', 'context']) v2.db.exec(`ALTER TABLE pending DROP COLUMN ${c}`);
   v2.db.exec('DROP TABLE intake_spools');
@@ -89,7 +91,9 @@ test('a v1 database is migrated to v6: attempts, started_at, stage tracking, int
   v2.db.pragma('user_version = 1');
   v2.close();
   const migrated = openStore(file);
-  assert.equal(migrated.db.pragma('user_version', { simple: true }), 6);
+  assert.equal(migrated.db.pragma('user_version', { simple: true }), 8);
+  assert.equal(migrated.getMeta('x'), null);
+  assert.deepEqual(migrated.listAliases(), []);
   assert.equal(migrated.beginIntakeBatch('b1', 'h'), true);
   const jobId = migrated.createJob({ printer: 'p2s', startedAt: '2026-10-13T21:10:59.844Z', dryRun: false });
   assert.equal(migrated.getJob(jobId).started_at, '2026-10-13T21:10:59.844Z');
@@ -135,6 +139,8 @@ test('v5 -> v6 keeps existing print questions and fills in printer and tray_uuid
   const jobId = s.createJob({ printer: 'p2s', dryRun: false });
   s.replaceJobSources(jobId, [{ sourceKey: 'AMS 1 Tray 3', grams: 1, kind: 'ams', unit: 1, slot: 3, trayUuid: 'ABCD' }]);
   s.upsertPending({ jobId, sourceKey: 'AMS 1 Tray 3', reason: 'ambiguous_pairing', candidates: [{ spoolId: 4 }] });
+  s.db.exec('DROP TABLE meta');
+  s.db.exec('DROP TABLE filament_aliases');
   s.db.exec('DROP INDEX pending_insert_tray');
   for (const c of ['kind', 'printer', 'tray_uuid', 'context']) s.db.exec(`ALTER TABLE pending DROP COLUMN ${c}`);
   s.db.pragma('user_version = 5');
@@ -156,4 +162,18 @@ test('an inserted spool is asked about once per tray_uuid, whatever the answer w
   store.closePending(first.pending.id, 'skipped');
   assert.equal(ask().created, false);
   assert.equal(store.getInsertPending('ABCD').state, 'skipped');
+});
+
+test('filament aliases: one per reported pair, a new answer replaces it, removable', () => {
+  store.setAlias({ reportedFilamentId: 'GFG99', reportedColorHex: '000000', filamentId: 12 });
+  store.setAlias({ reportedFilamentId: 'GFG99', reportedColorHex: 'FFFFFF', filamentId: 12 });
+  store.setAlias({ reportedFilamentId: 'GFG99', reportedColorHex: '000000', filamentId: 15 }); // replaces
+  assert.deepEqual(store.listAliases().map((a) => [a.reported_filament_id, a.reported_color_hex, a.filament_id]), [
+    ['GFG99', 'FFFFFF', 12],
+    ['GFG99', '000000', 15],
+  ]);
+  assert.equal(store.aliasMap().get('GFG99|000000'), 15);
+  assert.equal(store.deleteAlias('GFG99', '000000'), true);
+  assert.equal(store.deleteAlias('GFG99', '000000'), false);
+  assert.equal(store.aliasMap().has('GFG99|000000'), false);
 });

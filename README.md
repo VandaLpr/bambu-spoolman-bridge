@@ -71,15 +71,42 @@ which spool each print used and deducts the grams when the print ends. The norma
     you're not asked again, and your answer covers both.
 - **External spool** (no RFID): matched on the filament selected on the printer screen
   (`filament_id` + color). Exactly one opened spool: use it. No opened spool: open the oldest unopened
-  one. If several are opened, or nothing matches, the bridge doesn't guess. A nearest-color fallback
-  is used only when it gives a single candidate.
+  one. If several are opened, or nothing matches, the bridge doesn't guess. Order:
+  - exact `filament_id` + colour;
+  - a **remembered answer**: once you've answered a question about an external spool, the
+    printer-reported filament id and colour are stored as an alias for the filament you chose, so
+    the same selection on the printer finds it next time. One alias per reported pair; a new
+    answer replaces it. Aliases are listed on the pending page and can be removed there;
+  - nearest colour, only when it gives a single candidate.
   - Non-Bambu filament works the same way. Selecting e.g. "Generic PETG" on the printer reports
     `GFG99`, which intake stores as the filament's `bambu_filament_id`.
 - The spool's location is set to the slot, e.g. `P2S AMS1 Slot 3`, or `A1`.
 
 When a source can't be resolved, you get an **actionable notification** with the two best candidates
-and an *Open bridge* button. With `BRIDGE_URL` set, tapping the notification itself also opens the page. The deduction waits until you answer, and the answer survives restarts.
-The bridge page is LAN-only, so that link works only on your home network.
+and an *Open bridge* button. With `BRIDGE_URL` set, tapping the notification itself also opens the page.
+The deduction waits until you answer, and the answer survives restarts. The bridge page is LAN-only,
+so that link works only on your home network.
+
+### The pending page
+
+Made for the phone, opened from the notification.
+
+1. **Choose the filament.** First what the printer reported, then the best matches: the exact
+   filament (same filament id and colour, or the same Bambu colour code) on top, then a remembered
+   answer, then close colours (within `NEAREST_COLOR_MAX_DE`) of the same filament id or material,
+   nearest first. A matching filament without a free spool (used up, or all its spools tied to other
+   RFID tags) still shows, with *+ New spool* to add one more spool of it. Every other
+   filament with a usable spool is grouped by material, each with its colour and stock
+   (e.g. "1 opened · 2 on shelf") and its printer aliases (✕ removes one). For an RFID tray only spools
+   not tied to another tag count.
+2. The bridge picks the spool: the one opened spool, otherwise the oldest unopened one (FIFO, which
+   gets `first_used`). Only when several spools are opened does a second step ask which one.
+3. **Not in Spoolman?** Search SpoolmanDB and *Add & use*: one new spool is created (the filament is
+   imported, with the filament id the printer reported) and used for the answer. Like intake, this
+   creates the spool even in DRY_RUN. A result that's already in your inventory (same external id,
+   colour code, or the same vendor's filament id + colour) shows *In inventory* and links to that
+   filament instead, so you can't create a duplicate by accident.
+4. A spool id field and *Skip* stay available at the bottom.
 
 ## Requirements
 
@@ -163,6 +190,10 @@ you switch DRY_RUN off. It's user-initiated and therefore **independent of DRY_R
     `longitudinal` for gradients and `coaxial` for multi-part colours (as SpoolmanDB classifies them),
     and an empty `color_hex`, as Spoolman requires. An RFID tray with several colours (`cols`) is
     matched on the whole set.
+  - Translucent and clear colours keep their alpha (`C9A38180`, `00000000`): colours are stored as
+    8-digit hex when the alpha isn't FF, and matching compares RGB. Filaments imported by 0.3.0
+    lost the alpha; a one-time correction at startup restores it for every filament whose colour
+    code maps to a non-opaque colour, unless its colour was changed by hand.
 - **Non-Bambu items**: `vendor`, `material`, `color_name`, `color_hex`.
   - `bambu_filament_id` becomes the generic id the printer reports for that material (Generic PLA =
     GFL99, Generic PETG = GFG99, and so on). Use `profile` for variants such as `"PLA Silk"`.
@@ -238,8 +269,12 @@ Images are published to `ghcr.io/vandalpr/bambu-spoolman-bridge` (`latest`, vers
 | POST | `/intake` | Import spools from an order list, see [Intake](#intake) |
 | POST | `/usage/:id/requeue` | Only for `needs_attention` rows: `{"spoolId": 12}` (same or another spool) or `{"skip": true}` |
 | GET | `/pending?state=open` | Pending sources |
-| GET | `/pending/:id` | Page to pick the spool (linked from notifications) |
-| POST | `/pending/:id/resolve` | `{"spoolId": 12}` or `{"skip": true}` |
+| GET | `/pending/:id` | The pending page, see [above](#the-pending-page) |
+| POST | `/pending/:id/resolve` | `{"filamentId": 7}`, `{"spoolId": 12}` or `{"skip": true}`. A filament with several opened spools answers 409 with `chooseSpool` |
+| POST | `/pending/:id/add` | `{"externalId": "…", "q": "search"}`: add one spool from SpoolmanDB and use it |
+| POST | `/pending/:id/new-spool` | `{"filamentId": 7}`: add one more spool of that filament and use it |
+| GET | `/aliases` | Remembered external-spool answers |
+| POST | `/aliases/remove` | `{"reported_filament_id": "GFG99", "reported_color_hex": "000000"}` |
 
 Don't expose this port to the internet.
 

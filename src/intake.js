@@ -21,8 +21,8 @@
 
 import { createHash } from 'node:crypto';
 import { bambuProfile, genericProfile, genericProfileNames } from './bambu/profiles.js';
-import { catalogSearchQuery, filamentFromCatalog, pickCatalogEntry } from './catalog.js';
-import { colorFields, filamentColors, normalizeHex, sameColors } from './color.js';
+import { catalogSearchQuery, filamentFromCatalog, localFilamentForEntry, pickCatalogEntry } from './catalog.js';
+import { colorFields, filamentColors, filamentStoredColors, normalizeHex, sameColors, storedHex } from './color.js';
 import { readExtra } from './spoolman/extra.js';
 
 const BATCH_ID = /^[A-Za-z0-9._:-]{1,100}$/;
@@ -89,6 +89,7 @@ function readItem(raw, index) {
 
   item.colorName = raw.color_name ?? null;
   item.colorHex = raw.color_hex === undefined || raw.color_hex === null ? null : normalizeHex(raw.color_hex);
+  item.colorStore = item.colorHex ? storedHex(raw.color_hex) : null; // keeps a non-opaque alpha
   if (raw.color_hex != null && !item.colorHex) need(`color_hex "${raw.color_hex}" is not a hex colour`);
   if (item.kind === 'bambu') {
     item.code = String(raw.bambu_color_code).trim();
@@ -132,7 +133,16 @@ function bambuTarget(item, colorTable) {
       return null;
     }
     if (!item.colorName) item.problems.push(`colour code ${item.code} is not in BambuStudio's table: give color_name`);
-    return withProfile(item, { filamentId: line.filamentId, code: item.code, hex: item.colorHex, hexes: [item.colorHex], direction: null, line: line.line, colorName: item.colorName });
+    return withProfile(item, {
+      filamentId: line.filamentId,
+      code: item.code,
+      hex: item.colorHex,
+      hexes: [item.colorHex],
+      stored: [item.colorStore],
+      direction: null,
+      line: line.line,
+      colorName: item.colorName,
+    });
   }
   if (item.productLine && lower(item.productLine) !== lower(entry.line)) {
     item.problems.push(`colour code ${item.code} is ${entry.line} ${entry.name}, not ${item.productLine}`);
@@ -149,6 +159,7 @@ function bambuTarget(item, colorTable) {
     code: entry.code,
     hex: entry.hex,
     hexes: entry.hexes,
+    stored: entry.stored,
     direction: entry.direction,
     line: entry.line,
     colorName: entry.name,
@@ -182,6 +193,7 @@ function otherTarget(item) {
     code: null,
     hex: item.colorHex,
     hexes: [item.colorHex],
+    stored: [item.colorStore],
     direction: null,
     line: profile.profile,
     colorName: item.colorName,
@@ -221,8 +233,9 @@ function filamentPatch(f, t) {
   if (readExtra(f, 'bambu_filament_id') !== t.filamentId) extra.bambu_filament_id = t.filamentId;
   if (t.code && readExtra(f, 'bambu_color_code') !== t.code) extra.bambu_color_code = t.code;
   let patch = {};
-  if (!sameColors(filamentColors(f), t.hexes)) {
-    patch = colorFields(t.hexes, t.direction);
+  // compared as stored, so a missing alpha (translucent colour) is corrected too
+  if (!sameColors(filamentStoredColors(f), t.stored)) {
+    patch = colorFields(t.stored, t.direction);
     if (!patch.multi_color_hexes && f.multi_color_hexes) Object.assign(patch, { multi_color_hexes: null, multi_color_direction: null });
   }
   return Object.keys(extra).length || Object.keys(patch).length ? { patch, extra } : null;
@@ -276,6 +289,7 @@ export function createIntake({ spoolman, store, colorTable, config, log, now = (
       if (target && !item.problems.length) {
         out.target = { filament_id: target.filamentId, color_code: target.code, color_hex: target.hex, line: target.line, color: target.colorName };
         if (target.hexes.length > 1) Object.assign(out.target, { color_hexes: target.hexes, direction: target.direction });
+        if (target.stored.some((h) => h.length === 8)) out.target.color_stored = target.stored;
         out.filament = await planFilamentFor(target, item, { filaments, vendors, catalog, plannedFilaments });
         out.spools = planSpools(item, batchId);
       }
@@ -326,7 +340,7 @@ export function createIntake({ spoolman, store, colorTable, config, log, now = (
       }
       plannedFilaments.set(key, item.index);
       // BambuStudio's colours win: that's what the RFID reports.
-      const params = { ...filamentFromCatalog(entry, { vendorId: vendor?.id ?? null, bambuFilamentId: t.filamentId }), ...colorFields(t.hexes, t.direction), extra };
+      const params = { ...filamentFromCatalog(entry, { vendorId: vendor?.id ?? null, bambuFilamentId: t.filamentId }), ...colorFields(t.stored, t.direction), extra };
       return { action: 'import', external_id: entry.id, name: entry.name, vendor: vendorPlan, params };
     }
 
@@ -338,7 +352,7 @@ export function createIntake({ spoolman, store, colorTable, config, log, now = (
       density: t.density,
       diameter: 1.75,
       weight: item.weight,
-      ...colorFields(t.hexes, t.direction),
+      ...colorFields(t.stored, t.direction),
       extra,
     };
     return { action: 'create', name: t.name, vendor: vendorPlan, params };
@@ -449,5 +463,59 @@ export function createIntake({ spoolman, store, colorTable, config, log, now = (
     return { batch_id: batchId, status, spool_ids: rows.map((r) => r.spool_id), items };
   }
 
-  return { plan, apply };
+  /**
+   * "Add from SpoolmanDB" on the pending page: one new spool of a catalog entry. Its filament
+   * is reused when Spoolman has it (colour code, filament id + colours, or external_id) and
+   * imported otherwise. bambuFilamentId is what the printer reported, so it finds the filament.
+   * User-initiated like intake, so independent of DRY_RUN.
+   * @param {string} query  the search that listed the entry (the catalog has no lookup by id)
+   */
+  async function addCatalogSpool({ query, externalId, bambuFilamentId = null }) {
+    const entry = (await spoolman.searchCatalog(query, { max: 100 })).find((e) => e.id === externalId);
+    if (!entry) throw new IntakeError(404, `SpoolmanDB entry ${externalId} not found for "${query}"`);
+    const [filaments, vendors] = await Promise.all([spoolman.listFilaments(), spoolman.listVendors()]);
+    const local = localFilamentForEntry(filaments, entry, { bambuFilamentId, colorTable: colorTable() });
+    const code = local.colorCode;
+    let filament = local.filament;
+    if (filament) {
+      const extra = {};
+      if (bambuFilamentId && !readExtra(filament, 'bambu_filament_id')) extra.bambu_filament_id = bambuFilamentId;
+      if (code && !readExtra(filament, 'bambu_color_code')) extra.bambu_color_code = code;
+      if (Object.keys(extra).length) await spoolman.patchFilamentExtra(filament.id, extra);
+    } else {
+      const vendor = vendors.find((v) => lower(v.name) === lower(entry.manufacturer));
+      const vendorId = await realizeVendor(vendor ? { action: 'reuse', id: vendor.id } : { action: 'create', name: entry.manufacturer }, { vendors });
+      const params = filamentFromCatalog(entry, { vendorId, bambuFilamentId });
+      if (code) params.extra.bambu_color_code = code;
+      filament = await spoolman.createFilament(params);
+      log.info(`pending page: imported ${entry.id} as filament #${filament.id}`);
+    }
+    const spool = await spoolman.createSpool({
+      filament_id: filament.id,
+      initial_weight: entry.weight,
+      ...(entry.spool_weight != null ? { spool_weight: entry.spool_weight } : {}),
+      comment: `added from the bridge (SpoolmanDB ${entry.id})`,
+    });
+    log.info(`pending page: new spool #${spool.id} of filament #${filament.id}`);
+    return { spoolId: spool.id, filamentId: filament.id, filamentName: filament.name };
+  }
+
+  /**
+   * "+ New spool" on the pending page: one more spool of a filament Spoolman already has,
+   * e.g. when its only spool is tied to another RFID tag. User-initiated, like intake.
+   */
+  async function addFilamentSpool({ filamentId }) {
+    const filament = (await spoolman.listFilaments()).find((f) => f.id === filamentId);
+    if (!filament) throw new IntakeError(404, `filament #${filamentId} not found in Spoolman`);
+    const spool = await spoolman.createSpool({
+      filament_id: filament.id,
+      ...(filament.weight != null ? { initial_weight: filament.weight } : {}),
+      ...(filament.spool_weight != null ? { spool_weight: filament.spool_weight } : {}),
+      comment: 'added from the bridge',
+    });
+    log.info(`pending page: new spool #${spool.id} of filament #${filament.id}`);
+    return { spoolId: spool.id, filamentId: filament.id, filamentName: filament.name };
+  }
+
+  return { plan, apply, addCatalogSpool, addFilamentSpool };
 }

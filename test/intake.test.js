@@ -301,3 +301,77 @@ test('a single-colour filament whose colour is wrong is corrected; a multi-colou
   const duo = await intake.plan({ items: [{ bambu_color_code: '99901', form: 'spool', count: 1 }] });
   assert.deepEqual(duo.items[0].filament.update.patch, { color_hex: null, multi_color_hexes: '1F3A93,C0392B', multi_color_direction: 'coaxial' });
 });
+
+test('Add from SpoolmanDB: imports the entry with the reported filament id and creates one spool', async () => {
+  const entry = { id: 'acme_petg_black_1000_175_n', manufacturer: 'Acme', name: 'Black', material: 'PETG', density: 1.27, weight: 1000, spool_weight: 200, diameter: 1.75, color_hex: '111111' };
+  const spoolman = createFakeSpoolman({ spools: [], filaments: [], catalog: [entry] });
+  const intake = createIntake({ spoolman, store, colorTable: () => createColorTable(colorCodes), config: {}, log: silentLog });
+  const first = await intake.addCatalogSpool({ query: 'acme petg', externalId: entry.id, bambuFilamentId: 'GFG99' });
+  const s = spoolman.db.spools.find((x) => x.id === first.spoolId);
+  assert.deepEqual([s.initial_weight, s.spool_weight, s.comment], [1000, 200, 'added from the bridge (SpoolmanDB acme_petg_black_1000_175_n)']);
+  assert.deepEqual([s.filament.external_id, s.filament.vendor.name, readExtra(s.filament, 'bambu_filament_id')], [entry.id, 'Acme', 'GFG99']);
+  assert.equal(spoolman.writes('createVendor').length, 1);
+
+  // again: the filament is reused, only a spool is created
+  const second = await intake.addCatalogSpool({ query: 'acme petg', externalId: entry.id, bambuFilamentId: 'GFG99' });
+  assert.equal(second.filamentId, first.filamentId);
+  assert.equal(spoolman.writes('createFilament').length, 1);
+  assert.equal(spoolman.writes('createSpool').length, 2);
+  await rejects(intake.addCatalogSpool({ query: 'acme petg', externalId: 'nope' }), 404);
+});
+
+test('Add from SpoolmanDB for a Bambu tray also stores the colour code', async () => {
+  const spoolman = createFakeSpoolman({ spools: [], filaments: [], catalog });
+  const intake = createIntake({ spoolman, store, colorTable: () => createColorTable(colorCodes), config: {}, log: silentLog });
+  const { spoolId } = await intake.addCatalogSpool({ query: 'bambu lab pla', externalId: 'bambulab_pla_mattedarkred_1000_175_n', bambuFilamentId: 'GFA01' });
+  const f = spoolman.db.spools.find((x) => x.id === spoolId).filament;
+  assert.deepEqual([readExtra(f, 'bambu_filament_id'), readExtra(f, 'bambu_color_code')], ['GFA01', '11202']);
+});
+
+// Translucent entries (alpha 80 / 00), invented codes shaped like BambuStudio's.
+const translucentTable = () =>
+  createColorTable({
+    data: [
+      ...colorCodes.data,
+      { fila_color_code: '99201', fila_id: 'GFG01', fila_type: 'PETG Translucent', fila_color_type: '单色', fila_color_name: { en: 'Clear' }, fila_color: ['#00000000'] },
+      { fila_color_code: '99202', fila_id: 'GFG01', fila_type: 'PETG Translucent', fila_color_type: '单色', fila_color_name: { en: 'Translucent Brown' }, fila_color: ['#C9A38180'] },
+    ],
+  });
+
+test('translucent colours are stored with their alpha; an existing opaque copy is corrected', async () => {
+  const brown = { ...goldFilament, id: 8, name: 'Translucent Brown', material: 'PETG', color_hex: 'C9A381', extra: { bambu_filament_id: '"GFG01"', bambu_color_code: '"99202"' } };
+  const spoolman = createFakeSpoolman({ spools: [], filaments: [brown], catalog: [] });
+  const table = translucentTable();
+  const intake = createIntake({ spoolman, store, colorTable: () => table, config: {}, log: silentLog });
+  const { items } = await intake.plan({ items: [{ bambu_color_code: '99201', form: 'spool', count: 1 }, { bambu_color_code: '99202', form: 'spool', count: 1 }] });
+  assert.equal(items[0].filament.action, 'create');
+  assert.equal(items[0].filament.params.color_hex, '00000000');
+  assert.deepEqual(items[0].target.color_stored, ['00000000']);
+  assert.deepEqual([items[1].filament.action, items[1].filament.update.patch], ['reuse', { color_hex: 'C9A38180' }]);
+});
+
+test('"+ New spool": one more spool of an existing filament', async () => {
+  const spoolman = createFakeSpoolman({ spools: [], filaments: [goldFilament], catalog });
+  const intake = createIntake({ spoolman, store, colorTable: () => null, config: {}, log: silentLog });
+  const { spoolId, filamentName } = await intake.addFilamentSpool({ filamentId: 1 });
+  const s = spoolman.db.spools.find((x) => x.id === spoolId);
+  assert.deepEqual([s.filament.id, s.initial_weight, s.spool_weight, s.comment, filamentName], [1, 1000, 250, 'added from the bridge', 'Gold']);
+  await rejects(intake.addFilamentSpool({ filamentId: 999 }), 404);
+});
+
+test('localFilamentForEntry: by external_id, by colour code, by filament id + colour', async () => {
+  const { localFilamentForEntry } = await import('../src/catalog.js');
+  const table = createColorTable(colorCodes);
+  const entry = { id: 'bambulab_pla_gold_1000_175_n', manufacturer: 'Bambu Lab', name: 'Gold', material: 'PLA', color_hex: 'E4BD68' };
+  assert.equal(localFilamentForEntry([goldFilament], entry).filament.id, 1); // external_id
+  const noExt = { ...goldFilament, external_id: null, color_hex: 'E4BD60' }; // other hex, right code
+  assert.equal(localFilamentForEntry([noExt], { ...entry, id: 'x' }, { bambuFilamentId: 'GFA00', colorTable: table }).filament.id, 1);
+  const byIdHex = { ...goldFilament, external_id: null, extra: { bambu_filament_id: '"GFA00"' } };
+  assert.equal(localFilamentForEntry([byIdHex], { ...entry, id: 'x' }, { bambuFilamentId: 'GFA00' }).filament.id, 1);
+  assert.equal(localFilamentForEntry([byIdHex], { ...entry, id: 'x' }).filament, null); // nothing to go on
+  // a generic id + colour belongs to one vendor only
+  const acme = { ...goldFilament, id: 9, external_id: null, vendor: { id: 7, name: 'Acme' }, color_hex: '000000', extra: { bambu_filament_id: '"GFG99"' } };
+  const polymaker = { id: 'polymaker_petg_black', manufacturer: 'Polymaker', name: 'Black', material: 'PETG', color_hex: '000000' };
+  assert.equal(localFilamentForEntry([acme], polymaker, { bambuFilamentId: 'GFG99' }).filament, null);
+  assert.equal(localFilamentForEntry([acme], { ...polymaker, manufacturer: 'acme' }, { bambuFilamentId: 'GFG99' }).filament.id, 9);
+});

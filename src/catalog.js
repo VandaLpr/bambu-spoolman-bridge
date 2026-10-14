@@ -4,7 +4,7 @@
 // material and exact color, narrowed by the variant word in the HA name (Matte, Silk+...).
 
 import { densityFor } from './bambu/profiles.js';
-import { colorFields, filamentColors, normalizeHex, sameColors } from './color.js';
+import { colorFields, filamentColors, normalizeHex, sameColors, storedHex } from './color.js';
 import { readExtra } from './spoolman/extra.js';
 
 export const CREATED_COMMENT = 'auto-created from RFID by bridge';
@@ -70,6 +70,23 @@ export function planFilament({ filaments, catalogEntries, query, vendorId }) {
   return { create: filamentFromRfid(query, { vendorId }) };
 }
 
+/**
+ * The local filament a SpoolmanDB entry corresponds to, if any: by colour code (from the
+ * printer-reported filament id and the entry's colours), filament id + colours, or external_id.
+ * Shared by the pending page ("In inventory") and "Add from SpoolmanDB", so they agree.
+ */
+export function localFilamentForEntry(filaments, entry, { bambuFilamentId = null, colorTable = null } = {}) {
+  const hexes = (entry.color_hexes?.length ? entry.color_hexes : [entry.color_hex]).map(normalizeHex).filter(Boolean);
+  const colorCode = bambuFilamentId ? (colorTable?.byFilamentAndHex(bambuFilamentId, hexes[0], hexes)?.code ?? null) : null;
+  // Filament id + colour only identifies a filament of the same vendor: a generic id such as
+  // GFG99 is shared by every non-Bambu PETG, so Polymaker black is not Acme black.
+  const sameVendor = filaments.filter((f) => f.vendor?.name?.toLowerCase() === entry.manufacturer?.toLowerCase());
+  const filament =
+    findExistingFilament(filaments, { colorCode, externalId: entry.id }) ??
+    findExistingFilament(sameVendor, { filamentId: bambuFilamentId, colorHex: hexes[0], colorHexes: hexes });
+  return { filament, colorCode, hexes };
+}
+
 export function catalogSearchQuery(query) {
   return ['Bambu Lab', query.material].filter(Boolean).join(' ');
 }
@@ -117,7 +134,7 @@ export function filamentFromCatalog(entry, { vendorId, bambuFilamentId }) {
     diameter: entry.diameter,
     weight: entry.weight,
     spool_weight: entry.spool_weight ?? undefined,
-    ...colorFields(entry.color_hexes?.length ? entry.color_hexes.map(normalizeHex).filter(Boolean) : [normalizeHex(entry.color_hex)], entry.multi_color_direction ?? null),
+    ...colorFields(entry.color_hexes?.length ? entry.color_hexes.map(storedHex).filter(Boolean) : [storedHex(entry.color_hex)], entry.multi_color_direction ?? null),
     settings_extruder_temp: entry.extruder_temp ?? undefined,
     settings_bed_temp: entry.bed_temp ?? undefined,
     external_id: entry.id,
@@ -128,15 +145,15 @@ export function filamentFromCatalog(entry, { vendorId, bambuFilamentId }) {
 export function filamentFromRfid(query, { vendorId }) {
   const label = String(query.name || query.material || 'Filament').replace(/^bambu(\s+lab)?\s+/i, '');
   return {
-    name: `${label} #${query.colorHex}`,
+    name: `${label} #${query.colorHex}`, // RGB in the name; the colour field keeps alpha
     vendor_id: vendorId,
     material: query.material ?? undefined,
     density: densityFor(query.filamentId) ?? FALLBACK_DENSITY,
     diameter: 1.75,
     weight: query.trayWeight ?? undefined,
     ...(query.colorHexes?.length > 1 && query.colorDirection
-      ? colorFields(query.colorHexes, query.colorDirection)
-      : { color_hex: query.colorHex ?? undefined }),
+      ? colorFields(query.colorStores ?? query.colorHexes, query.colorDirection)
+      : { color_hex: query.colorStore ?? query.colorHex ?? undefined }),
     comment: CREATED_COMMENT,
     extra: { bambu_filament_id: query.filamentId, ...(query.colorCode ? { bambu_color_code: query.colorCode } : {}) },
   };

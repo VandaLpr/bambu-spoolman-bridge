@@ -107,7 +107,7 @@ describe('AMS tray with RFID', () => {
       via: 'created',
       filamentId: null,
       filamentQuery: {
-        filamentId: 'GFA00', colorHex: '000000', material: 'PLA', name: 'Bambu PLA Basic',
+        filamentId: 'GFA00', colorHex: '000000', colorStore: '000000', material: 'PLA', name: 'Bambu PLA Basic',
         trayWeight: 1000, nozzleTempMin: 190, nozzleTempMax: 230, colorCode: null,
       },
       spool: {
@@ -324,4 +324,48 @@ describe('multi-colour spools', () => {
     assert.deepEqual([f.color_hex, f.multi_color_hexes, f.multi_color_direction], [null, '1F3A93,C0392B', 'coaxial']);
     assert.deepEqual(f.extra, { bambu_filament_id: 'GFA05', bambu_color_code: '99901' });
   });
+});
+
+describe('remembered external-spool answers (aliases)', () => {
+  // The A1 reports Generic PETG black; the user said that is Acme PETG Black (filament 60).
+  const reported = { ...petgWhite, filamentId: 'GFG99', colorHex: '000000', colorHexes: [], material: 'PETG' };
+  const acme = filament({ id: 60, name: 'Black', material: 'PETG', colorHex: '101010', bambuId: 'GFG98' });
+  const aliases = new Map([['GFG99|000000', 60]]);
+  const resolveExt = (spools, extra = {}) => resolveSource({ identity: reported, location: 'A1', inventory: { spools, filaments: [] }, now: NOW, aliases, ...extra });
+
+  test('the alias resolves after the exact match and before nearest colour', () => {
+    const d = resolveExt([spool({ id: 61, filament: acme, firstUsed: NOW })]);
+    assert.deepEqual([d.status, d.via, d.spoolId], ['resolved', 'alias', 61]);
+  });
+
+  test('an exact match still wins over the alias', () => {
+    const exact = filament({ id: 62, name: 'Black', material: 'PETG', colorHex: '000000', bambuId: 'GFG99' });
+    const d = resolveExt([spool({ id: 61, filament: acme, firstUsed: NOW }), spool({ id: 63, filament: exact, firstUsed: NOW })]);
+    assert.deepEqual([d.via, d.spoolId], ['matched', 63]);
+  });
+
+  test('the alias follows the usual spool rules: oldest unopened gets first_used; several opened -> ask', () => {
+    const fifo = resolveExt([spool({ id: 65, filament: acme }), spool({ id: 64, filament: acme })]);
+    assert.deepEqual([fifo.via, fifo.spoolId, fifo.writes[0].patch.first_used], ['alias_unopened', 64, NOW]);
+    const ask = resolveExt([spool({ id: 64, filament: acme, firstUsed: NOW }), spool({ id: 65, filament: acme, firstUsed: NOW })]);
+    assert.equal(ask.reason, 'ambiguous_opened');
+  });
+
+  test('an alias filament without a usable spool falls through to nearest colour', () => {
+    const near = filament({ id: 66, name: 'Jet', material: 'PETG', colorHex: '050505', bambuId: 'GFG99' });
+    const d = resolveExt([spool({ id: 61, filament: acme, remaining: 0 }), spool({ id: 67, filament: near, firstUsed: NOW })]);
+    assert.deepEqual([d.via, d.spoolId], ['nearest', 67]);
+  });
+
+  test('a different reported colour does not use the alias', () => {
+    const d = resolveSource({ identity: { ...reported, colorHex: 'FF0000' }, location: 'A1', inventory: { spools: [spool({ id: 61, filament: acme })], filaments: [] }, aliases });
+    assert.equal(d.status, 'pending');
+  });
+});
+
+test('an RFID tray with a translucent colour creates its filament with the alpha', () => {
+  const clearTray = identityFromTray({ ...tray(1), filament_id: 'GFG01', type: 'PETG', name: 'Bambu PETG Translucent', color: '#00000000', cols: ['#00000000'] });
+  assert.deepEqual([clearTray.colorHex, clearTray.colorStore], ['000000', '00000000']);
+  const d = resolveSource({ identity: clearTray, location: 'x', inventory: { spools: [], filaments: [] }, now: NOW });
+  assert.equal(filamentFromRfid(d.filamentQuery, { vendorId: 1 }).color_hex, '00000000');
 });

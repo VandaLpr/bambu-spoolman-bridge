@@ -13,7 +13,7 @@ const table = createColorTable(colorCodes);
 test('colour codes resolve to filament id, product line, English name and hex (the RFID values)', () => {
   assert.equal(table.size, 5);
   assert.deepEqual(table.byCode('10401'), {
-    code: '10401', filamentId: 'GFA00', line: 'PLA Basic', name: 'Gold', hex: 'E4BD68', hexes: ['E4BD68'], kind: 'single', direction: null,
+    code: '10401', filamentId: 'GFA00', line: 'PLA Basic', name: 'Gold', hex: 'E4BD68', hexes: ['E4BD68'], stored: ['E4BD68'], kind: 'single', direction: null,
   });
   assert.equal(table.byCode(11202).name, 'Dark Red'); // numbers work too
   assert.equal(table.byCode('99999'), null);
@@ -78,4 +78,18 @@ test('Bambu profiles by filament id, with their own densities', () => {
   assert.equal(bambuProfile('GFA01').density, 1.32);
   assert.equal(densityFor('GFG99'), 1.27);
   assert.equal(densityFor('GFX42'), null);
+});
+
+test('stored colours keep a non-opaque alpha; matching stays RGB', async () => {
+  const { storedHex, normalizeHex, filamentStoredColors, filamentColors } = await import('../src/color.js');
+  assert.equal(storedHex('#C9A38180'), 'C9A38180');
+  assert.equal(storedHex('#00000000'), '00000000');
+  assert.equal(storedHex('#E4BD68FF'), 'E4BD68');
+  assert.equal(storedHex('e4bd68'), 'E4BD68');
+  assert.equal(storedHex('nope'), null);
+  assert.equal(normalizeHex('C9A38180'), 'C9A381');
+  const clear = { color_hex: '00000000' };
+  assert.deepEqual([filamentStoredColors(clear), filamentColors(clear)], [['00000000'], ['000000']]);
+  const t = createColorTable({ data: [{ fila_color_code: '32101', fila_id: 'GFG01', fila_type: 'PETG Translucent', fila_color_type: '单色', fila_color_name: { en: 'Clear' }, fila_color: ['#00000000'] }] });
+  assert.deepEqual([t.byCode('32101').hex, t.byCode('32101').stored], ['000000', ['00000000']]);
 });

@@ -21,7 +21,30 @@
 
 import Database from 'better-sqlite3';
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 8;
+
+// Bridge state that isn't per job (v8), e.g. which one-time maintenance steps have run.
+const META_SCHEMA = `
+CREATE TABLE meta (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`;
+
+// Filament aliases (v7): remembered answers for external spools. The printer reports a
+// (filament id, colour) pair from what is selected on its screen; once the user said which
+// Spoolman filament that is, the pair maps to it. One alias per pair; a new answer replaces it.
+const ALIASES_SCHEMA = `
+CREATE TABLE filament_aliases (
+  reported_filament_id TEXT NOT NULL,
+  reported_color_hex   TEXT NOT NULL,
+  filament_id          INTEGER NOT NULL,
+  created_at           TEXT NOT NULL,
+  PRIMARY KEY (reported_filament_id, reported_color_hex)
+);
+CREATE INDEX filament_aliases_filament ON filament_aliases (filament_id);
+`;
 
 // Pending v6: a question is either about a print source (kind 'print', tied to a job) or about
 // a spool just inserted into an AMS slot (kind 'insert', no job; context holds the tray identity
@@ -211,6 +234,16 @@ export function openStore(file) {
                                ON CONFLICT (tray_uuid) WHERE kind = 'insert' DO NOTHING`),
     insertPendingFor: stmt(`SELECT * FROM pending WHERE kind = 'insert' AND tray_uuid = ?`),
     openPrintPendingsFor: stmt(`SELECT * FROM pending WHERE kind = 'print' AND tray_uuid = ? AND state = 'open' ORDER BY id`),
+
+    setAlias: stmt(`INSERT INTO filament_aliases (reported_filament_id, reported_color_hex, filament_id, created_at)
+                    VALUES (@reportedFilamentId, @reportedColorHex, @filamentId, @ts)
+                    ON CONFLICT (reported_filament_id, reported_color_hex)
+                    DO UPDATE SET filament_id = excluded.filament_id, created_at = excluded.created_at`),
+    deleteAlias: stmt(`DELETE FROM filament_aliases WHERE reported_filament_id = ? AND reported_color_hex = ?`),
+    listAliases: stmt(`SELECT * FROM filament_aliases ORDER BY filament_id, reported_filament_id, reported_color_hex`),
+    getMeta: stmt(`SELECT value FROM meta WHERE key = ?`),
+    setMeta: stmt(`INSERT INTO meta (key, value, updated_at) VALUES (@key, @value, @ts)
+                   ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`),
     pending: stmt(`SELECT * FROM pending WHERE id = ?`),
     listPending: stmt(`SELECT * FROM pending WHERE state = ? ORDER BY id DESC`),
     closePending: stmt(`UPDATE pending SET state = @state, chosen_spool_id = @spoolId, resolved_at = @ts
@@ -319,6 +352,16 @@ export function openStore(file) {
     },
     getInsertPending: (trayUuid) => parsePending(q.insertPendingFor.get(trayUuid)),
     openPrintPendingsFor: (trayUuid) => q.openPrintPendingsFor.all(trayUuid).map(parsePending),
+
+    // reportedColorHex is a normalized 6-digit hex (no #, no alpha)
+    setAlias: ({ reportedFilamentId, reportedColorHex, filamentId }) =>
+      q.setAlias.run({ reportedFilamentId, reportedColorHex, filamentId, ts: now() }),
+    deleteAlias: (reportedFilamentId, reportedColorHex) => q.deleteAlias.run(reportedFilamentId, reportedColorHex).changes > 0,
+    listAliases: () => q.listAliases.all(),
+    // "GFG99|000000" -> Spoolman filament id, for the resolver
+    getMeta: (key) => q.getMeta.get(key)?.value ?? null,
+    setMeta: (key, value) => q.setMeta.run({ key, value: String(value), ts: now() }),
+    aliasMap: () => new Map(q.listAliases.all().map((a) => [`${a.reported_filament_id}|${a.reported_color_hex}`, a.filament_id])),
     getPending: (id) => parsePending(q.pending.get(id)),
     getPendingFor: (jobId, sourceKey) => parsePending(q.pendingFor.get(jobId, sourceKey)),
     listPending: (state = 'open') => q.listPending.all(state).map(parsePending),
@@ -351,6 +394,8 @@ function migrate(db) {
     }
     if (version < 5) db.exec(INTAKE_SCHEMA);
     if (version < 6) db.exec(PENDING_V6);
+    if (version < 7) db.exec(ALIASES_SCHEMA);
+    if (version < 8) db.exec(META_SCHEMA);
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
   })();
 }
