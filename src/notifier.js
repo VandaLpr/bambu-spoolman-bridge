@@ -8,6 +8,7 @@ const MAX_BUTTONS = 2;
 const REASONS = {
   ambiguous_opened: 'several opened spools match',
   ambiguous_pairing: 'several opened spools could hold this RFID tag',
+  ambiguous_pairing_color: 'several filaments have a close colour',
   ambiguous_color: 'several filament colors are close',
   no_match: 'no matching spool in Spoolman',
   no_spool_info: 'the printer reports no filament for this source',
@@ -22,10 +23,10 @@ export function parseAction(action) {
   return m ? { pendingId: Number(m[1]), spoolId: Number(m[2]) } : null;
 }
 
-export function pendingMessage({ pending, printerName, taskName, source }) {
+export function pendingMessage({ pending, printerName, taskName, source, inserted = false }) {
   const what = [source.material, source.name, source.color_hex ? `#${source.color_hex}` : null].filter(Boolean).join(' ');
   const lines = [
-    `${printerName}${taskName ? ` · "${taskName}"` : ''}`,
+    `${printerName}${inserted ? ' · spool just inserted' : ''}${taskName ? ` · "${taskName}"` : ''}`,
     `${pending.source_key}${what ? ` (${what})` : ''}: ${REASONS[pending.reason] ?? pending.reason}.`,
     pending.candidates.length ? 'Which spool is it?' : 'Pick the spool in the bridge.',
     'The bridge link works only on home Wi-Fi.',
@@ -49,11 +50,12 @@ export function createNotifier({ ha, service, dryRun, bridgeUrl, log }) {
   const openBridge = (path) => ({ action: 'URI', title: 'Open bridge', uri: `${bridgeUrl}${path}` });
 
   return {
-    async pending({ pending, printerName, taskName, source }) {
+    // inserted: the question is about a spool just put into an AMS slot (no print yet)
+    async pending({ pending, printerName, taskName, source, inserted = false }) {
       const page = `${bridgeUrl}/pending/${pending.id}`;
       const actions = pending.candidates.slice(0, MAX_BUTTONS).map((c) => ({ action: actionId(pending.id, c.spoolId), title: c.label }));
       if (bridgeUrl) actions.push(openBridge(`/pending/${pending.id}`));
-      await send('Which spool?', pendingMessage({ pending, printerName, taskName, source }), {
+      await send('Which spool?', pendingMessage({ pending, printerName, taskName, source, inserted }), {
         actions,
         // A plain tap opens the bridge page too: url for iOS, clickAction for Android.
         ...(bridgeUrl ? { url: page, clickAction: page } : {}),

@@ -1,0 +1,65 @@
+{
+  "data": [
+    {
+      "fila_color_code": "10401",
+      "fila_id": "GFA00",
+      "fila_color_type": "单色",
+      "fila_type": "PLA Basic",
+      "fila_color_name": {
+        "en": "Gold"
+      },
+      "fila_color": [
+        "#E4BD68FF"
+      ]
+    },
+    {
+      "fila_color_code": "10101",
+      "fila_id": "GFA00",
+      "fila_color_type": "单色",
+      "fila_type": "PLA Basic",
+      "fila_color_name": {
+        "en": "Black"
+      },
+      "fila_color": [
+        "#000000FF"
+      ]
+    },
+    {
+      "fila_color_code": "11202",
+      "fila_id": "GFA01",
+      "fila_color_type": "单色",
+      "fila_type": "PLA Matte",
+      "fila_color_name": {
+        "en": "Dark Red"
+      },
+      "fila_color": [
+        "#BB3D43FF"
+      ]
+    },
+    {
+      "fila_color_code": "10201",
+      "fila_id": "GFA00",
+      "fila_color_type": "单色",
+      "fila_type": "PLA Basic",
+      "fila_color_name": {
+        "en": "Beige"
+      },
+      "fila_color": [
+        "#F7E6DEFF"
+      ]
+    },
+    {
+      "fila_color_code": "30106",
+      "fila_id": "GFG00",
+      "fila_color_type": "单色",
+      "fila_type": "PETG Basic",
+      "fila_color_name": {
+        "en": "White"
+      },
+      "fila_color": [
+        "#FFFFFFFF"
+      ]
+    }
+  ],
+  "total": 5
+}

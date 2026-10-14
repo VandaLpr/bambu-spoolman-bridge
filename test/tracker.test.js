@@ -1,12 +1,13 @@
 import { test, describe, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { createColorTable } from '../src/bambu/colors.js';
 import { createExecutor } from '../src/executor.js';
 import { resolveEntities } from '../src/ha/entities.js';
 import { readExtra } from '../src/spoolman/extra.js';
 import { openStore } from '../src/store.js';
 import { PrinterTracker, resolvePending } from '../src/tracker.js';
 import { createFakeSpoolman, createRecordingNotifier, createWorld, silentLog } from './fixtures/fakes.js';
-import { a1External, activeTray, catalog, printWeight, tray } from './fixtures/ha.js';
+import { a1External, activeTray, catalog, colorCodes, printWeight, tray } from './fixtures/ha.js';
 import { filament, goldFilament, goldSpool, spool } from './fixtures/spoolman.js';
 
 const P2S = { prefix: 'p2s', name: 'P2S', amsLocation: 'P2S AMS{unit} Slot {n}', externalLocation: 'P2S External', refreshDelayMs: 0, entities: {} };
@@ -40,6 +41,9 @@ function rig({
   initial = {},
   initialAt,
   weightWaitMs = 60_000,
+  colorTable = null,
+  insertSettleMs = 5,
+  insertMaxWaitMs = 1000,
   history = async () => {
     throw new Error('no recorder in this test');
   },
@@ -59,14 +63,16 @@ function rig({
   }, initialAt);
   const { ids } = resolveEntities(printer, world.get());
   const warnings = [];
-  const log = { ...silentLog, warn: (m) => warnings.push(m) };
+  const infos = [];
+  const log = { ...silentLog, warn: (m) => warnings.push(m), info: (m) => infos.push(m) };
   const ha = { pressed: [], historyCalls: [], pressButton: async (id) => ha.pressed.push(id) };
   ha.history = async (ids, since) => {
     ha.historyCalls.push({ ids, since });
     return history(ids, since);
   };
   const config = { dryRun, jobStartToleranceSec: 120, nearestColorMaxDeltaE: 20 };
-  const tracker = new PrinterTracker({ printer, ids, store, executor, notifier, ha, config, log, sleep: async () => {}, debounceMs: 0, weightWaitMs });
+  const tracker = new PrinterTracker({ printer, ids, store, executor, notifier, ha, config, log, sleep: async () => {}, debounceMs: 0, weightWaitMs,
+    colorTable: () => colorTable, insertSettleMs, insertMaxWaitMs });
   const push = async (changes, at) => {
     tracker.onEntities(world.update(changes, at));
     await tracker.idle();
@@ -77,7 +83,7 @@ function rig({
   };
   const spoolById = (id) => spoolman.db.spools.find((s) => s.id === id);
   const usage = () => store.listUsage().map((u) => [u.source_key, u.spool_id, u.grams, u.write_state]).sort();
-  return { spoolman, notifier, executor, world, tracker, push, start, spoolById, usage, warnings };
+  return { spoolman, notifier, executor, world, tracker, push, start, spoolById, usage, warnings, infos };
 }
 
 async function fourColorPrint(r) {
@@ -672,5 +678,220 @@ describe('failed prints and current_stage', () => {
     await r.push({ progress: '63' }, '2026-10-12T22:49:57.018Z');
     await r.push({ status: 'failed', stage: 'idle' }, '2026-10-12T22:50:02.835Z');
     assert.deepEqual(r.usage(), [['AMS 1 Tray 2', 2, 0.04, 'applied']]);
+  });
+});
+
+// An RFID spool put into an AMS slot outside a print is paired right away. No deduction.
+describe('pair on insert', () => {
+  const table = createColorTable(colorCodes);
+  const NEW_UUID = 'C0FFEE00C0FFEE00C0FFEE00C0FFEE00';
+  const emptyTray = (n) => ({
+    state: 'Empty',
+    attributes: { ...tray(n), tray_uuid: '00000000000000000000000000000000', tag_uid: '0000000000000000', remain: -1, empty: true, type: '', filament_id: '' },
+  });
+  // Tray 3 attributes (PLA Matte Dark Red) for a freshly inserted spool.
+  const inserted = (remain, uuid = NEW_UUID) => ({ state: 'Bambu PLA Matte', attributes: { ...tray(3), tray_uuid: uuid, remain } });
+  // Matte Dark Red imported via intake: hex from elsewhere, the right colour code.
+  const intakeFil = { ...filament({ id: 40, name: 'Matte Dark Red', colorHex: 'B83C42', bambuId: 'GFA01' }), extra: { bambu_filament_id: '"GFA01"', bambu_color_code: '"11202"' } };
+
+  function insertRig({ weighed = false, dryRun = false, initial = {} } = {}) {
+    const blackTagged = spool({ id: 2, filament: blackFil, remaining: 600, firstUsed: T1, rfid: uuid(2), tags: [uuid(2)], location: 'P2S AMS1 Slot 2' });
+    const r = rig({
+      spools: [goldSpool, blackTagged, spool({ id: 41, filament: intakeFil, remaining: 1000, location: 'Shelf' })],
+      filaments: [goldFilament, blackFil, intakeFil],
+      colorTable: table,
+      dryRun,
+      initial: { 'sensor.p2s_ams_1_tray_3': emptyTray(3), ...initial },
+    });
+    store.beginIntakeBatch('order-1', 'hash');
+    store.recordIntakeSpool({ batchId: 'order-1', itemIndex: 0, unitIndex: 0, spoolId: 41, weighed });
+    return r;
+  }
+
+  test('an intake spool is paired by colour code, gets the AMS estimate and its slot', async () => {
+    const r = insertRig();
+    await r.start();
+    r.tracker.onEntities(r.world.update({ 'sensor.p2s_ams_1_tray_3': inserted(-1) })); // the tag is read first ...
+    await r.push({ 'sensor.p2s_ams_1_tray_3': inserted(77) }); // ... the estimate ~10 s later
+    const s = r.spoolById(41);
+    assert.equal(readExtra(s, 'rfid_uuid'), NEW_UUID);
+    assert.deepEqual(s.tags.map((t) => t.uid), [NEW_UUID]);
+    assert.equal(s.remaining_weight, 770);
+    assert.equal(s.location, 'P2S AMS1 Slot 3');
+    assert.ok(s.first_used);
+    assert.equal(store.estimatedSpoolIds().has(41), false); // corrected once, never again
+    assert.equal(store.listJobs().length, 0);
+    assert.equal(r.spoolman.writes('useWeight').length, 0);
+    const line = r.infos.find((m) => m.startsWith('insert '));
+    assert.equal(
+      line,
+      `insert AMS 1 Tray 3: tray_uuid ${NEW_UUID}, remain 77% -> spool #41 (same colour code), remaining 1000 -> 770 g (AMS 77%), location P2S AMS1 Slot 3`,
+    );
+  });
+
+  test('pairing waits until the AMS reports remain', async () => {
+    const r = insertRig();
+    await r.start();
+    r.tracker.onEntities(r.world.update({ 'sensor.p2s_ams_1_tray_3': inserted(-1) }));
+    await new Promise((resolve) => setTimeout(resolve, 40)); // several quiet periods
+    assert.deepEqual(r.spoolman.calls, []);
+    await r.push({ 'sensor.p2s_ams_1_tray_3': inserted(77) });
+    assert.equal(r.spoolById(41).remaining_weight, 770);
+  });
+
+  test('a weighed intake spool is paired but keeps its weight', async () => {
+    const r = insertRig({ weighed: true });
+    await r.start();
+    await r.push({ 'sensor.p2s_ams_1_tray_3': inserted(77) });
+    assert.equal(readExtra(r.spoolById(41), 'rfid_uuid'), NEW_UUID);
+    assert.equal(r.spoolById(41).remaining_weight, 1000);
+  });
+
+  test('an already tagged spool moved to another slot only gets the new location', async () => {
+    const r = insertRig({ initial: { 'sensor.p2s_ams_1_tray_4': emptyTray(4) } });
+    await r.start();
+    await r.push({ 'sensor.p2s_ams_1_tray_2': emptyTray(2) });
+    await r.push({ 'sensor.p2s_ams_1_tray_4': { state: 'Bambu PLA Basic', attributes: { ...tray(2) } } });
+    assert.deepEqual(r.spoolman.calls, [['patchSpool', 2, { location: 'P2S AMS1 Slot 4' }, null]]);
+    assert.match(r.infos.find((m) => m.startsWith('insert ')), /-> spool #2 \(already tagged\), location P2S AMS1 Slot 4$/);
+  });
+
+  test('during a print, an insert into an unused slot is paired without touching the job', async () => {
+    const r = insertRig();
+    await r.start();
+    await r.push({ status: 'prepare', progress: '0', startTime: T1, taskName: 'Test print', printWeight: pw(printWeight.failedAt63) });
+    await r.push({ status: 'running', progress: '10' });
+    await r.push({ 'sensor.p2s_ams_1_tray_3': inserted(77) });
+    assert.equal(readExtra(r.spoolById(41), 'rfid_uuid'), NEW_UUID);
+    const [job] = store.listJobs();
+    assert.deepEqual(store.getJobSources(job.id).map((s) => s.source_key), ['AMS 1 Tray 2']);
+    await r.push({ status: 'finish', progress: '100' });
+    assert.deepEqual(r.usage(), [['AMS 1 Tray 2', 2, 0.56, 'applied']]);
+    assert.equal(r.spoolById(41).remaining_weight, 770); // nothing deducted from the inserted spool
+  });
+
+  test('a swap into a slot the running print uses is left to the print', async () => {
+    const r = insertRig();
+    await r.start();
+    await r.push({ status: 'prepare', progress: '0', startTime: T1, taskName: 'Test print', printWeight: pw({ 'AMS 1 Tray 3': 5 }) });
+    const callsBefore = r.spoolman.calls.length;
+    await r.push({ 'sensor.p2s_ams_1_tray_3': inserted(77) });
+    assert.equal(r.spoolman.calls.length, callsBefore);
+    assert.match(r.infos.find((m) => m.startsWith('insert ')), /is part of job \d+; the print's own pairing applies/);
+  });
+
+  test('DRY_RUN: the insert is only logged', async () => {
+    const r = insertRig({ dryRun: true });
+    const before = structuredClone(r.spoolman.db.spools);
+    await r.start();
+    await r.push({ 'sensor.p2s_ams_1_tray_3': inserted(77) });
+    assert.deepEqual(r.spoolman.db.spools, before);
+    assert.ok(r.spoolman.writes('linkTag').length > 0); // the would-be writes are logged
+    assert.equal(store.estimatedSpoolIds().has(41), true); // not marked: nothing was written
+    assert.match(r.infos.find((m) => m.includes('insert ')), /^\[DRY RUN\] insert AMS 1 Tray 3: .* -> spool #41 \(same colour code\), remaining 1000 -> 770 g/);
+  });
+
+  test('an unknown spool is auto-created on insert', async () => {
+    const r = insertRig();
+    r.spoolman.db.spools = r.spoolman.db.spools.filter((s) => s.id !== 41);
+    await r.start();
+    await r.push({ 'sensor.p2s_ams_1_tray_3': inserted(77) });
+    const created = r.spoolman.db.spools.find((s) => readExtra(s, 'rfid_uuid') === NEW_UUID);
+    assert.equal(created.filament.id, 40); // the imported filament, found by colour code: no duplicate
+    assert.match(r.infos.find((m) => m.startsWith('insert ')), /-> new spool #\d+ auto-created from RFID/);
+  });
+});
+
+describe('questions at insert time', () => {
+  const table = createColorTable(colorCodes);
+  const NEW_UUID = 'BEEF0000BEEF0000BEEF0000BEEF0000';
+  const emptyTray = { state: 'Empty', attributes: { ...tray(3), tray_uuid: '00000000000000000000000000000000', tag_uid: '0000000000000000', remain: -1, empty: true, type: '', filament_id: '' } };
+  const inserted = { state: 'Bambu PLA Matte', attributes: { ...tray(3), tray_uuid: NEW_UUID, remain: 77 } };
+  const fil = { ...filament({ id: 40, name: 'Matte Dark Red', colorHex: 'B83C42', bambuId: 'GFA01' }), extra: { bambu_filament_id: '"GFA01"', bambu_color_code: '"11202"' } };
+
+  // Two opened spools of the same colour (and one unopened intake spool): the bridge must ask.
+  function questionRig({ dryRun = false } = {}) {
+    const r = rig({
+      spools: [
+        goldSpool,
+        spool({ id: 2, filament: blackFil, remaining: 600, firstUsed: T1, rfid: uuid(2), tags: [uuid(2)], location: 'P2S AMS1 Slot 2' }),
+        spool({ id: 41, filament: fil, remaining: 1000 }),
+        spool({ id: 42, filament: fil, remaining: 500, firstUsed: T1 }),
+        spool({ id: 43, filament: fil, remaining: 300, firstUsed: T1 }),
+      ],
+      filaments: [goldFilament, blackFil, fil],
+      colorTable: table,
+      dryRun,
+      initial: { 'sensor.p2s_ams_1_tray_3': emptyTray },
+    });
+    store.beginIntakeBatch('order-1', 'hash');
+    store.recordIntakeSpool({ batchId: 'order-1', itemIndex: 0, unitIndex: 0, spoolId: 41, weighed: false });
+    return r;
+  }
+  const answer = (r, pendingId, spoolId) => resolvePending({ store, spoolman: r.spoolman, executor: r.executor, log: silentLog, pendingId, spoolId });
+
+  test('an ambiguous insert is asked about right away, once per tray_uuid', async () => {
+    const r = questionRig();
+    await r.start();
+    await r.push({ 'sensor.p2s_ams_1_tray_3': inserted });
+    assert.equal(r.notifier.sent.pending.length, 1);
+    const sent = r.notifier.sent.pending[0];
+    assert.equal(sent.inserted, true);
+    assert.deepEqual(sent.pending.candidates.map((c) => c.spoolId), [42, 43]);
+    assert.match(r.infos.find((m) => m.startsWith('insert ')), /not paired: ambiguous_pairing \(candidates #42, #43\); asked \(pending \d+\)$/);
+
+    // taken out and put back: not asked again
+    await r.push({ 'sensor.p2s_ams_1_tray_3': emptyTray });
+    await r.push({ 'sensor.p2s_ams_1_tray_3': { ...inserted, attributes: { ...inserted.attributes, remain: 76 } } });
+    assert.equal(r.notifier.sent.pending.length, 1);
+    assert.match(r.infos.filter((m) => m.startsWith('insert ')).at(-1), /already asked about this tray_uuid/);
+  });
+
+  test('answering it pairs the tray with the chosen spool, with the intake estimate, and no deduction', async () => {
+    const r = questionRig();
+    await r.start();
+    await r.push({ 'sensor.p2s_ams_1_tray_3': inserted });
+    const { pending } = r.notifier.sent.pending[0];
+    const result = await answer(r, pending.id, 41); // the unopened intake spool, not one of the buttons
+    assert.equal(result.ok, true);
+    assert.match(result.message, /Spool #41 paired with AMS 1 Tray 3; remaining set to 770 g/);
+    const s = r.spoolById(41);
+    assert.deepEqual([readExtra(s, 'rfid_uuid'), s.tags.map((t) => t.uid), s.remaining_weight, s.location], [NEW_UUID, [NEW_UUID], 770, 'P2S AMS1 Slot 3']);
+    assert.equal(store.getInsertPending(NEW_UUID).state, 'resolved');
+    assert.equal(r.spoolman.writes('useWeight').length, 0);
+  });
+
+  test('a print using the spool while the insert question is open is not asked again; one answer covers both', async () => {
+    const r = questionRig();
+    await r.start();
+    await r.push({ 'sensor.p2s_ams_1_tray_3': inserted });
+    await r.push({ status: 'prepare', progress: '0', startTime: T1, taskName: 'Test print', printWeight: pw({ 'AMS 1 Tray 3': 5 }) });
+    assert.equal(r.notifier.sent.pending.length, 1); // still only the insert question
+    const [job] = store.listJobs();
+    const printQuestion = store.getPendingFor(job.id, 'AMS 1 Tray 3');
+    assert.deepEqual([printQuestion.kind, printQuestion.tray_uuid, printQuestion.state], ['print', NEW_UUID, 'open']);
+
+    await answer(r, r.notifier.sent.pending[0].pending.id, 42);
+    assert.equal(store.getPendingFor(job.id, 'AMS 1 Tray 3').state, 'resolved');
+    await r.push({ status: 'running', progress: '10' });
+    await r.push({ status: 'finish', progress: '100' });
+    assert.deepEqual(r.usage(), [['AMS 1 Tray 3', 42, 5, 'applied']]);
+  });
+
+  test('answering the print question also closes the open insert question', async () => {
+    const r = questionRig();
+    await r.start();
+    await r.push({ 'sensor.p2s_ams_1_tray_3': inserted });
+    await r.push({ status: 'prepare', progress: '0', startTime: T1, taskName: 'Test print', printWeight: pw({ 'AMS 1 Tray 3': 5 }) });
+    const [job] = store.listJobs();
+    await answer(r, store.getPendingFor(job.id, 'AMS 1 Tray 3').id, 43);
+    assert.deepEqual([store.getInsertPending(NEW_UUID).state, store.getInsertPending(NEW_UUID).chosen_spool_id], ['resolved', 43]);
+  });
+
+  test('DRY_RUN: the question is still sent (the notifier adds [DRY RUN])', async () => {
+    const r = questionRig({ dryRun: true });
+    await r.start();
+    await r.push({ 'sensor.p2s_ams_1_tray_3': inserted });
+    assert.equal(r.notifier.sent.pending.length, 1);
   });
 });

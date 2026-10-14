@@ -80,3 +80,9 @@ test('problem notifications get an Open bridge button for their page, but no tap
   assert.deepEqual(plain.data, { group: 'bambu-spoolman-bridge' });
   assert.equal(plain.message, 'details');
 });
+
+test('a question about a just-inserted spool says so', async () => {
+  const { calls, notifier } = capture();
+  await notifier.pending({ pending: { ...pending, source_key: 'AMS 1 Tray 3' }, printerName: 'P2S', taskName: null, source, inserted: true });
+  assert.match(calls[0][2].message, /^P2S · spool just inserted\nAMS 1 Tray 3/);
+});

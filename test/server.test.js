@@ -1,5 +1,6 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { IntakeError } from '../src/intake.js';
 import { createApp } from '../src/server.js';
 import { openStore } from '../src/store.js';
 
@@ -14,6 +15,7 @@ before(async () => {
   store = openStore(':memory:');
   const jobId = store.createJob({ printer: 'a1', taskName: '<b>Test</b> print', dryRun: false });
   store.upsertPending({ jobId, sourceKey: 'External Spool', reason: 'ambiguous_opened', candidates: [{ spoolId: 20, label: '#20 · PETG White' }] });
+  store.addInsertPending({ printer: 'p2s', sourceKey: 'AMS 1 Tray 3', trayUuid: 'ABCD', reason: 'ambiguous_pairing', candidates: [{ spoolId: 42, label: '#42 · PLA Matte Dark Red' }], context: {} });
   usageId = store.recordUsage({ jobId, printer: 'a1', sourceKey: 'External Spool', spoolId: 20, grams: 10.07, status: 'finish', dryRun: false, writeState: 'queued' });
   store.countUsageAttempt(usageId);
   store.setUsageState(usageId, 'needs_attention', { error: 'GET /spool/20 -> HTTP 404' });
@@ -21,6 +23,15 @@ before(async () => {
     store,
     dryRun: false,
     health: () => ({ ok: true, version: 'test' }),
+    intake: {
+      plan: async (body) => ({ status: 'ready', echo: body }),
+      apply: async (body) => {
+        if (body.batch_id === 'conflict') throw new IntakeError(409, 'batch_id was already used for different items');
+        if (body.batch_id === 'needs') throw new IntakeError(422, 'some items need input; nothing was written', { status: 'needs_input', items: [] });
+        if (body.batch_id === 'down') throw new Error('POST /spool failed: connect ECONNREFUSED');
+        return { status: 'applied', spool_ids: [5, 6] };
+      },
+    },
     requeueUsage: async (id, spoolId) => {
       requeues.push([id, spoolId]);
       return { ok: true, message: 'requeued' };
@@ -49,7 +60,7 @@ test('GET /health, /jobs, /jobs/:id, /usage, /pending', async () => {
   assert.deepEqual(job.usage.map((u) => u.write_state), ['needs_attention']);
   assert.equal((await fetch(`${base}/jobs/999`)).status, 404);
   assert.equal((await (await fetch(`${base}/usage`)).json()).length, 1);
-  assert.equal((await (await fetch(`${base}/pending`)).json()).length, 1);
+  assert.equal((await (await fetch(`${base}/pending`)).json()).length, 2);
 });
 
 test('the pending page escapes HTML and offers each candidate', async () => {
@@ -93,4 +104,39 @@ test('POST /usage/:id/requeue validates input and passes spool or skip through',
   assert.equal((await post({ spoolId: 21 })).status, 200);
   assert.equal((await post({ skip: true })).status, 200);
   assert.deepEqual(requeues, [[usageId, 21], [usageId, null]]);
+});
+
+test('POST /intake: plan by default, apply only with apply: true, errors mapped to status codes', async () => {
+  const post = (body) => fetch(`${base}/intake`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const plan = await post({ batch_id: 'b1', items: [{ bambu_color_code: '10401' }] });
+  assert.equal(plan.status, 200);
+  assert.equal((await plan.json()).status, 'ready');
+  assert.equal((await post({ batch_id: 'b1', apply: 'yes', items: [] })).status, 200); // only true applies
+  assert.deepEqual(await (await post({ batch_id: 'b1', apply: true, items: [] })).json(), { status: 'applied', spool_ids: [5, 6] });
+  assert.equal((await post({ batch_id: 'conflict', apply: true })).status, 409);
+  const needs = await post({ batch_id: 'needs', apply: true });
+  assert.equal(needs.status, 422);
+  assert.equal((await needs.json()).status, 'needs_input');
+  const down = await post({ batch_id: 'down', apply: true });
+  assert.equal(down.status, 502);
+  assert.match((await down.json()).error, /Re-post the same batch to resume/);
+});
+
+test('the page of an insert question names the printer and the slot', async () => {
+  const html = await (await fetch(`${base}/pending/2`)).text();
+  assert.match(html, /p2s · spool just inserted · AMS 1 Tray 3/);
+  assert.match(html, /#42 · PLA Matte Dark Red/);
+});
+
+test('the icon is served and used as favicon on the pages', async () => {
+  const png = await fetch(`${base}/assets/icon.png`);
+  assert.equal(png.status, 200);
+  assert.equal(png.headers.get('content-type'), 'image/png');
+  assert.match((await fetch(`${base}/assets/icon.svg`)).headers.get('content-type'), /^image\/svg\+xml/);
+  const ico = await fetch(`${base}/favicon.ico`);
+  assert.equal(ico.status, 200);
+  assert.equal(ico.headers.get('content-type'), 'image/png');
+  const html = await (await fetch(`${base}/pending/1`)).text();
+  assert.match(html, /<link rel="icon" href="\/assets\/icon.svg" type="image\/svg\+xml">/);
+  assert.match(html, /<link rel="apple-touch-icon" href="\/assets\/icon.png">/);
 });

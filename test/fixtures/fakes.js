@@ -39,7 +39,7 @@ export function createFakeSpoolman({ spools = [], filaments = [], catalog = [], 
     calls,
     writes: (name) => calls.filter((c) => c[0] === name),
     /**
-     * points: getSpool, useWeight:before (nothing applied), useWeight:after (applied, then error).
+     * points: getSpool, createSpool, useWeight:before (nothing applied), useWeight:after (applied, then error).
      * Default error is a network error (no HTTP status); pass httpError(404) etc. for responses.
      */
     failNext(point, err = new SpoolmanError(`${point} failed`), times = 1) {
@@ -57,15 +57,22 @@ export function createFakeSpoolman({ spools = [], filaments = [], catalog = [], 
     listFields: async () => [],
     searchCatalog: async () => catalog,
 
-    createVendor: async (params) => write('createVendor', [params], () => ({ ...params, id: nextId++ })),
+    createVendor: async (params) =>
+      write('createVendor', [params], () => {
+        const v = { ...params, id: nextId++, extra: {} };
+        db.vendors.push(v);
+        return structuredClone(v);
+      }),
     createFilament: async (params) =>
       write('createFilament', [params], () => {
-        const f = { ...params, id: nextId++, vendor, extra: encodeExtra(params.extra || {}) };
+        const v = db.vendors.find((x) => x.id === params.vendor_id) ?? vendor;
+        const f = { ...params, id: nextId++, vendor: v, extra: encodeExtra(params.extra || {}) };
         db.filaments.push(f);
         return structuredClone(f);
       }),
-    createSpool: async (params) =>
-      write('createSpool', [params], () => {
+    createSpool: async (params) => {
+      fail('createSpool');
+      return write('createSpool', [params], () => {
         const filament = db.filaments.find((f) => f.id === params.filament_id);
         const remaining = params.remaining_weight ?? params.initial_weight ?? filament.weight;
         const s = {
@@ -78,13 +85,16 @@ export function createFakeSpoolman({ spools = [], filaments = [], catalog = [], 
           used_weight: (params.initial_weight ?? filament.weight) - remaining,
           location: params.location ?? null,
           comment: params.comment ?? null,
+          spool_weight: params.spool_weight ?? null,
+          price: params.price ?? null,
           archived: false,
           extra: encodeExtra(params.extra || {}),
           tags: [],
         };
         db.spools.push(s);
         return structuredClone(s);
-      }),
+      });
+    },
     useWeight: async (id, grams) => {
       fail('useWeight:before');
       return write('useWeight', [id, grams], () => {
@@ -101,6 +111,13 @@ export function createFakeSpoolman({ spools = [], filaments = [], catalog = [], 
         Object.assign(s, patch);
         if (extra) s.extra = { ...s.extra, ...encodeExtra(extra) };
         return structuredClone(s);
+      }),
+    patchFilament: async (id, patch) =>
+      write('patchFilament', [id, patch], () => {
+        const f = db.filaments.find((x) => x.id === id);
+        Object.assign(f, patch);
+        for (const sp of db.spools) if (sp.filament?.id === id) Object.assign(sp.filament, patch);
+        return structuredClone(f);
       }),
     patchFilamentExtra: async (id, extra) =>
       write('patchFilamentExtra', [id, extra], () => {

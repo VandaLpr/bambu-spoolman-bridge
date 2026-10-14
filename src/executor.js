@@ -26,6 +26,8 @@ export function createExecutor({ spoolman, store, notifier, dryRun, log, now = (
     for (const w of writes) {
       if (w.op === 'patchSpool') {
         await spoolman.patchSpool(w.spoolId, w.patch, w.extra ?? null);
+      } else if (w.op === 'patchFilament') {
+        await spoolman.patchFilament(w.filamentId, w.patch);
       } else if (w.op === 'linkTag') {
         try {
           await spoolman.linkTag(w.spoolId, w.uid, w.format);
@@ -73,6 +75,8 @@ export function createExecutor({ spoolman, store, notifier, dryRun, log, now = (
   async function applyDecision(decision) {
     if (decision.status === 'resolved') {
       await runWrites(decision.writes);
+      // Only once it was really written: in DRY_RUN the spool keeps its estimate status.
+      if (decision.correction && !dryRun) store.markRemainingCorrected(decision.correction.spoolId);
       return { spoolId: decision.spoolId, resolution: decision.via };
     }
     if (decision.status === 'create') return { spoolId: await createFromDecision(decision), resolution: 'created' };

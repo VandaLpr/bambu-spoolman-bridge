@@ -12,6 +12,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
 COPY src ./src
+COPY assets ./assets
 
 # Runs as "node" (1000:1000) by default. On Unraid, run it as 99:100 (nobody:users)
 # with `user: "99:100"` (compose) or --user 99:100 so /data matches appdata ownership.

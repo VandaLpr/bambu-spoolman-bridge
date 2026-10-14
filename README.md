@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon.png" width="128" height="128" alt="bambu-spoolman-bridge icon"></p>
+
 # bambu-spoolman-bridge
 
 Tracks Bambu Lab filament consumption in [Spoolman](https://github.com/Donkie/Spoolman) automatically.
@@ -43,15 +45,36 @@ which spool each print used and deducts the grams when the print ends. The norma
   with different `tag_uid` but the same `tray_uuid`.
   1. A Spoolman spool with that tag linked (native Spoolman tags, 0.27+).
   2. A spool whose `rfid_uuid` extra field holds it. The tag is then linked too.
-  3. First-time pairing: an unbound spool of the same `bambu_filament_id` and color. An opened spool
-     wins; otherwise the oldest unopened one (FIFO). `rfid_uuid` and the tag are written to it.
+  3. First-time pairing of an unbound spool, for example one imported via [intake](#intake). Among
+     equivalent spools the opened one wins, otherwise the oldest unopened one (FIFO). Several opened
+     spools → you're asked. `rfid_uuid` and the tag are written to it. Tried in this order:
+     - same `bambu_filament_id` and exact colour;
+     - same Bambu colour code: the RFID's filament id and colour give the code via BambuStudio's table,
+       so a filament whose hex came from elsewhere still matches;
+     - nearest colour among unbound spools of the same filament id (within `NEAREST_COLOR_MAX_DE`), only
+       if exactly one filament qualifies and it has no different colour code. That filament's colour
+       is then corrected to what the RFID reports. Two close filaments → you're asked.
   4. Otherwise a new spool is created with `remaining = remain% × tray_weight`. Its filament is reused
-     if one exists, else imported from SpoolmanDB, else built from the RFID data. Filaments are never
-     duplicated.
+     if one exists (by colour code, then filament id + colour), else imported from SpoolmanDB, else
+     built from the RFID data. Filaments are never duplicated.
+- **Remaining weight of intake spools**: a spool imported without a measured `remaining_weight` counts
+  as full. When it's first paired and the AMS estimates it below 95%, the remaining weight becomes
+  `remain% × tray_weight`, once. A spool you weighed and imported with its weight keeps it.
+- **Pair on insert**: when an RFID spool goes into an AMS slot outside a print, or into a slot the
+  running print doesn't use, it's paired right away, with the same steps, and gets its location. No
+  deduction.
+  - The AMS reads the tag first and its remaining estimate about 10 s later, so pairing waits for both.
+  - Each insert logs one line: tray, `tray_uuid`, remain%, the spool and why, and any weight correction.
+  - Like all automatic writes, this only logs in DRY_RUN.
+  - If the spool can't be paired without guessing, you're asked right away: you're standing at the
+    printer. Each `tray_uuid` is asked about once. If a print uses that spool before you answer,
+    you're not asked again, and your answer covers both.
 - **External spool** (no RFID): matched on the filament selected on the printer screen
   (`filament_id` + color). Exactly one opened spool: use it. No opened spool: open the oldest unopened
   one. If several are opened, or nothing matches, the bridge doesn't guess. A nearest-color fallback
   is used only when it gives a single candidate.
+  - Non-Bambu filament works the same way. Selecting e.g. "Generic PETG" on the printer reports
+    `GFG99`, which intake stores as the filament's `bambu_filament_id`.
 - The spool's location is set to the slot, e.g. `P2S AMS1 Slot 3`, or `A1`.
 
 When a source can't be resolved, you get an **actionable notification** with the two best candidates
@@ -86,6 +109,9 @@ All configuration is environment variables; see [.env.example](.env.example).
 | `JOB_START_TOLERANCE_SEC` | no | `120` | `start_time` jitter treated as the same print |
 | `NEAREST_COLOR_MAX_DE` | no | `20` | Max color distance (CIE76 ΔE) for the nearest-color fallback |
 | `SPOOLMAN_RETRY_MINUTES` | no | `5` | Retry interval for deductions that couldn't be written |
+| `BAMBU_COLOR_REF` | no | commit `804d93bb5d` | BambuStudio git ref (commit, tag or branch) for the colour code table. Change it to pick up new colours. |
+| `TARE_SPOOL_G` | no | | Empty cardboard spool weight for intake (`form: "spool"`) |
+| `TARE_REFILL_G` | no | | Weight of the reusable spool a refill goes on (`form: "refill"`) |
 
 `PRINTERS` example:
 
@@ -103,6 +129,56 @@ as in HA (`ams_1` = 1) and `{n}` is the slot. Optional per printer: `refreshDela
 
 At startup the bridge logs a table of every entity it found or missed. A printer with missing required
 entities (`print_status`, `print_progress`, `print_weight`) is not tracked.
+
+## Intake
+
+`POST /intake` imports spools from order lists into Spoolman, so the inventory is in place before
+you switch DRY_RUN off. It's user-initiated and therefore **independent of DRY_RUN**.
+
+```json
+{
+  "batch_id": "order-2026-10-14",
+  "apply": false,
+  "items": [
+    {"product_line": "PLA Matte", "color_name": "Lilac Purple", "bambu_color_code": "11700", "form": "refill", "count": 2},
+    {"bambu_color_code": "10401", "form": "spool", "count": 1, "remaining_weight": 640, "opened": true, "location": "Shelf 2"},
+    {"vendor": "Acme", "material": "PETG", "color_name": "Black", "color_hex": "000000", "form": "spool", "count": 1, "price": 18.9, "order_ref": "A-123"}
+  ]
+}
+```
+
+- **`apply: false`** (default) returns the plan and writes nothing: per item the resolved filament id,
+  colour code and hex, whether the filament is reused, updated, imported or created, and the spools to
+  create.
+  - **`apply: true`** writes. If any item needs input, the whole batch is rejected (HTTP 422) and the
+    plan lists what's missing.
+- **Idempotent**: re-posting a batch returns its spool ids and creates nothing. The same `batch_id`
+  with different items is refused (409). If Spoolman fails halfway (502), re-post the same batch: only
+  the missing spools are created.
+- **Bambu items**: `bambu_color_code` is resolved through BambuStudio's colour table to the filament
+  id, product line, English colour name and the hex the RFID reports.
+  - A `product_line` that contradicts the code needs your input; a different `color_name` only warns.
+  - Codes missing from the table need `product_line`, `color_name` and `color_hex`.
+  - Multi-colour filaments get all their colours in `multi_color_hexes`, with `multi_color_direction`
+    `longitudinal` for gradients and `coaxial` for multi-part colours (as SpoolmanDB classifies them),
+    and an empty `color_hex`, as Spoolman requires. An RFID tray with several colours (`cols`) is
+    matched on the whole set.
+- **Non-Bambu items**: `vendor`, `material`, `color_name`, `color_hex`.
+  - `bambu_filament_id` becomes the generic id the printer reports for that material (Generic PLA =
+    GFL99, Generic PETG = GFG99, and so on). Use `profile` for variants such as `"PLA Silk"`.
+  - The vendor is reused or created by name.
+- **Common optional fields**: `weight` (default 1000), `remaining_weight` (measured; never overwritten
+  by the AMS estimate), `opened`, `location`, `price`, `order_ref` (goes into the comment),
+  `spool_weight` (overrides the tare).
+- **Filaments are resolved local-first**: by colour code, then filament id + colour (or, for non-Bambu,
+  vendor + material + colour), then a SpoolmanDB import, then created in SpoolmanDB style (e.g.
+  "Matte Lilac Purple", material PLA). `bambu_filament_id`, `bambu_color_code` and `color_hex` are
+  always set.
+
+The colour table is BambuStudio's `filaments_color_codes.json`. BambuStudio is AGPL-3.0, so the table
+is downloaded at runtime from the pinned `BAMBU_COLOR_REF` and cached in `DATA_DIR`; it isn't part of
+this repository. Generic and Bambu filament ids, materials and densities live in
+`src/bambu/profiles.js`; `node scripts/verify-profiles.mjs [ref]` re-checks them against BambuStudio.
 
 ## DRY_RUN walkthrough
 
@@ -148,6 +224,7 @@ Images are published to `ghcr.io/vandalpr/bambu-spoolman-bridge` (`latest`, vers
   ```
 - Give Home Assistant a fixed IP (DHCP reservation) and use it in `HA_URL`.
 - The image has a healthcheck on `/health`.
+- Icon URL: `https://raw.githubusercontent.com/vandalpr/bambu-spoolman-bridge/main/assets/icon.png`
 
 ## HTTP API (LAN only, no authentication)
 
@@ -158,6 +235,7 @@ Images are published to `ghcr.io/vandalpr/bambu-spoolman-bridge` (`latest`, vers
 | GET | `/jobs/:id` | Job with its sources (resolution decisions) and usage rows |
 | GET | `/usage?limit=100` | Usage history |
 | GET | `/usage/:id` | Page for one deduction; a rejected one can be re-queued or skipped there |
+| POST | `/intake` | Import spools from an order list, see [Intake](#intake) |
 | POST | `/usage/:id/requeue` | Only for `needs_attention` rows: `{"spoolId": 12}` (same or another spool) or `{"skip": true}` |
 | GET | `/pending?state=open` | Pending sources |
 | GET | `/pending/:id` | Page to pick the spool (linked from notifications) |

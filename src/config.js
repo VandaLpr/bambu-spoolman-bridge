@@ -1,5 +1,7 @@
 // Environment parsing and validation. Every problem is collected and reported at once.
 
+import { DEFAULT_COLOR_REF } from './bambu/colors.js';
+
 const LOG_LEVELS = ['debug', 'info', 'warn', 'error'];
 
 export class ConfigError extends Error {}
@@ -10,6 +12,13 @@ export function loadConfig(env = process.env) {
     const v = env[key]?.trim();
     if (!v) problems.push(`${key} is required`);
     return v;
+  };
+  // Optional grams, null when unset (e.g. tare weights not measured yet).
+  const optionalGrams = (key) => {
+    if (env[key] === undefined || env[key].trim() === '') return null;
+    const n = Number(env[key]);
+    if (!Number.isFinite(n) || n < 0) problems.push(`${key} must be a non-negative number of grams`);
+    return n;
   };
   const number = (key, def) => {
     if (env[key] === undefined || env[key] === '') return def;
@@ -34,12 +43,11 @@ export function loadConfig(env = process.env) {
 
   const printers = parsePrinters(env.PRINTERS, problems);
 
-  if (problems.length) throw new ConfigError(`Invalid configuration:\n  - ${problems.join('\n  - ')}`);
-
-  return Object.freeze({
-    haUrl: haUrl.replace(/\/+$/, ''),
+  // Built before the problems check: number() and optionalGrams() report into problems too.
+  const config = Object.freeze({
+    haUrl: haUrl?.replace(/\/+$/, ''),
     haToken,
-    spoolmanUrl: spoolmanUrl.replace(/\/+$/, ''),
+    spoolmanUrl: spoolmanUrl?.replace(/\/+$/, ''),
     notifyService,
     bridgeUrl: env.BRIDGE_URL?.trim().replace(/\/+$/, '') || null,
     dryRun,
@@ -49,8 +57,15 @@ export function loadConfig(env = process.env) {
     jobStartToleranceSec: number('JOB_START_TOLERANCE_SEC', 120),
     nearestColorMaxDeltaE: number('NEAREST_COLOR_MAX_DE', 20),
     spoolmanRetryMinutes: number('SPOOLMAN_RETRY_MINUTES', 5),
+    // BambuStudio git ref (commit, tag or branch) for the colour code table.
+    bambuColorRef: env.BAMBU_COLOR_REF?.trim() || DEFAULT_COLOR_REF,
+    // Empty-spool weights for intake: cardboard spool / reusable spool a refill goes on.
+    tareSpoolG: optionalGrams('TARE_SPOOL_G'),
+    tareRefillG: optionalGrams('TARE_REFILL_G'),
     printers,
   });
+  if (problems.length) throw new ConfigError(`Invalid configuration:\n  - ${problems.join('\n  - ')}`);
+  return config;
 }
 
 function parsePrinters(raw, problems) {

@@ -1,9 +1,10 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { CREATED_COMMENT } from '../src/catalog.js';
+import { CREATED_COMMENT, filamentFromRfid } from '../src/catalog.js';
 import { choiceWrites, resolveSource } from '../src/resolver.js';
 import { identityFromTray } from '../src/sources.js';
-import { a1External, p2sExternal, tray } from './fixtures/ha.js';
+import { createColorTable } from '../src/bambu/colors.js';
+import { a1External, colorCodes, p2sExternal, tray } from './fixtures/ha.js';
 import { filament, goldFilament, goldSpool, spool } from './fixtures/spoolman.js';
 
 const NOW = '2026-10-13T10:00:00.000Z';
@@ -107,7 +108,7 @@ describe('AMS tray with RFID', () => {
       filamentId: null,
       filamentQuery: {
         filamentId: 'GFA00', colorHex: '000000', material: 'PLA', name: 'Bambu PLA Basic',
-        trayWeight: 1000, nozzleTempMin: 190, nozzleTempMax: 230,
+        trayWeight: 1000, nozzleTempMin: 190, nozzleTempMax: 230, colorCode: null,
       },
       spool: {
         initial_weight: 1000,
@@ -202,5 +203,125 @@ describe('choiceWrites (user picked a spool for a pending source)', () => {
       { op: 'patchSpool', spoolId: 4, patch: { location: 'P2S AMS1 Slot 2' }, extra: { rfid_uuid: black.trayUuid } },
       { op: 'linkTag', spoolId: 4, uid: black.trayUuid, format: 'bambu' },
     ]);
+  });
+});
+
+describe('pairing imported spools (colour code, nearest colour, remaining estimate)', () => {
+  const table = createColorTable(colorCodes);
+  const matte = identityFromTray(tray(3)); // GFA01 #BB3D43, remain 77 % of 1000 g -> code 11202
+  // Matte Dark Red imported from elsewhere with a slightly different hex but the right code.
+  const importedFil = (extra = {}) =>
+    filament({ id: 30, name: 'Matte Dark Red', colorHex: 'B83C42', bambuId: 'GFA01', ...extra });
+  const withCode = (f, code) => ({ ...f, extra: { ...f.extra, bambu_color_code: JSON.stringify(code) } });
+  const resolveRfid = (spools, extra = {}) =>
+    resolveSource({ identity: matte, location: 'P2S AMS1 Slot 3', inventory: { spools, filaments: [] }, now: NOW, colorTable: table, ...extra });
+
+  test('same colour code pairs an imported spool whose hex differs', () => {
+    const s = spool({ id: 31, filament: withCode(importedFil(), '11202') });
+    const d = resolveRfid([s]);
+    assert.equal(d.status, 'resolved');
+    assert.equal(d.via, 'paired_code');
+    assert.equal(d.spoolId, 31);
+    assert.deepEqual(d.writes.map((w) => w.op), ['patchSpool', 'linkTag']);
+  });
+
+  test('without the colour table the code step is skipped and the nearest colour still pairs', () => {
+    const s = spool({ id: 31, filament: withCode(importedFil(), '11202') });
+    const d = resolveRfid([s], { colorTable: null });
+    assert.equal(d.via, 'paired_nearest');
+  });
+
+  test('nearest colour pairs exactly one close filament and corrects its colour to the RFID value', () => {
+    const d = resolveRfid([spool({ id: 31, filament: importedFil() })]);
+    assert.equal(d.via, 'paired_nearest');
+    assert.deepEqual(d.writes.at(-1), { op: 'patchFilament', filamentId: 30, patch: { color_hex: 'BB3D43' } });
+  });
+
+  test('two close filaments are ambiguous: ask instead of guessing or auto-creating', () => {
+    const other = filament({ id: 32, name: 'Matte Crimson', colorHex: 'BE3F46', bambuId: 'GFA01' });
+    const d = resolveRfid([spool({ id: 31, filament: importedFil() }), spool({ id: 33, filament: other })]);
+    assert.equal(d.status, 'pending');
+    assert.equal(d.reason, 'ambiguous_pairing_color');
+    assert.deepEqual(d.candidates.map((c) => c.spoolId), [31, 33]);
+  });
+
+  test('a close filament with a different known colour code is another colour: auto-create instead', () => {
+    const d = resolveRfid([spool({ id: 31, filament: withCode(importedFil(), '11299') })]);
+    assert.equal(d.status, 'create');
+  });
+
+  test('several opened spools of the matched filament: ask', () => {
+    const f = withCode(importedFil(), '11202');
+    const d = resolveRfid([spool({ id: 31, filament: f, firstUsed: NOW }), spool({ id: 34, filament: f, firstUsed: NOW })]);
+    assert.equal(d.reason, 'ambiguous_pairing');
+  });
+
+  test('an imported shelf spool is paired, never duplicated by an RFID auto-create', () => {
+    const shelf = spool({ id: 31, filament: importedFil(), location: 'Shelf' });
+    const d = resolveRfid([shelf]);
+    assert.equal(d.status, 'resolved');
+    assert.equal(d.spoolId, 31);
+    assert.deepEqual(d.writes[0].extra, { rfid_uuid: matte.trayUuid });
+  });
+
+  test('intake spool without a weighed weight takes the AMS estimate when paired', () => {
+    const s = spool({ id: 31, filament: withCode(importedFil(), '11202'), remaining: 1000 });
+    const d = resolveRfid([s], { estimatedSpoolIds: new Set([31]) });
+    assert.deepEqual(d.correction, { spoolId: 31, from: 1000, to: 770, remainPct: 77 });
+    assert.equal(d.writes[0].patch.remaining_weight, 770);
+    assert.equal(d.writes[0].patch.first_used, NOW);
+  });
+
+  test('also for an intake spool marked opened (first_used set) but never deducted', () => {
+    const s = spool({ id: 31, filament: withCode(importedFil(), '11202'), remaining: 1000, firstUsed: NOW });
+    assert.equal(resolveRfid([s], { estimatedSpoolIds: new Set([31]) }).correction.to, 770);
+  });
+
+  test('a weighed intake spool keeps its weight: the AMS estimate never overwrites it', () => {
+    const s = spool({ id: 31, filament: withCode(importedFil(), '11202'), remaining: 640 });
+    const d = resolveRfid([s], { estimatedSpoolIds: new Set() }); // weighed spools are not in the set
+    assert.equal(d.correction, undefined);
+    assert.equal('remaining_weight' in d.writes[0].patch, false);
+  });
+
+  test('no correction at 95 % or more, after a deduction, or when the AMS has no estimate', () => {
+    const fresh = () => spool({ id: 31, filament: withCode(importedFil(), '11202'), remaining: 1000 });
+    const ids = new Set([31]);
+    assert.equal(resolveSource({ identity: { ...matte, remainPct: 95 }, location: 'x', inventory: { spools: [fresh()], filaments: [] }, colorTable: table, estimatedSpoolIds: ids }).correction, undefined);
+    assert.equal(resolveSource({ identity: { ...matte, remainPct: null }, location: 'x', inventory: { spools: [fresh()], filaments: [] }, colorTable: table, estimatedSpoolIds: ids }).correction, undefined);
+    const used = spool({ id: 31, filament: withCode(importedFil(), '11202'), remaining: 990 });
+    assert.equal(resolveRfid([used], { estimatedSpoolIds: ids }).correction, undefined);
+  });
+});
+
+describe('multi-colour spools', () => {
+  const table = createColorTable({
+    data: [
+      ...colorCodes.data,
+      { fila_color_code: '99901', fila_id: 'GFA05', fila_type: 'PLA Silk', fila_color_type: '多拼色', fila_color_name: { en: 'Test Duo' }, fila_color: ['#1F3A93FF', '#C0392BFF'] },
+    ],
+  });
+  // An RFID tray with a two-colour spool: color is the first colour, cols lists both.
+  const duo = identityFromTray({ ...tray(3), filament_id: 'GFA05', name: 'Bambu PLA Silk', color: '#1F3A93FF', cols: ['#1F3A93FF', '#C0392BFF'], tray_uuid: 'D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0' });
+  const duoFil = { ...filament({ id: 50, name: 'Silk Test Duo', colorHex: null, bambuId: 'GFA05' }), multi_color_hexes: 'C0392B,1F3A93', multi_color_direction: 'coaxial' };
+  const duoFilWithCode = { ...duoFil, extra: { ...duoFil.extra, bambu_color_code: '"99901"' } };
+
+  test('an intake spool of a multi-colour filament is paired via its colour code', () => {
+    const d = resolveSource({ identity: duo, location: 'P2S AMS1 Slot 3', inventory: { spools: [spool({ id: 51, filament: duoFilWithCode })], filaments: [] }, colorTable: table, now: NOW });
+    assert.deepEqual([d.status, d.via, d.spoolId], ['resolved', 'paired', 51]); // first colour matches exactly
+  });
+
+  test('an unknown multi-colour spool is auto-created with all its colours on an existing filament', () => {
+    const d = resolveSource({ identity: duo, location: 'x', inventory: { spools: [], filaments: [duoFil] }, colorTable: table, now: NOW });
+    assert.equal(d.status, 'create');
+    assert.equal(d.filamentId, 50); // same filament id and the same set of colours
+  });
+
+  test('without a matching filament the RFID query carries the colours and direction', () => {
+    const d = resolveSource({ identity: duo, location: 'x', inventory: { spools: [], filaments: [] }, colorTable: table, now: NOW });
+    assert.deepEqual([d.filamentQuery.colorCode, d.filamentQuery.colorHexes, d.filamentQuery.colorDirection], ['99901', ['1F3A93', 'C0392B'], 'coaxial']);
+    const f = filamentFromRfid(d.filamentQuery, { vendorId: 1 });
+    assert.deepEqual([f.color_hex, f.multi_color_hexes, f.multi_color_direction], [null, '1F3A93,C0392B', 'coaxial']);
+    assert.deepEqual(f.extra, { bambu_filament_id: 'GFA05', bambu_color_code: '99901' });
   });
 });

@@ -96,6 +96,8 @@ export function createSpoolmanClient({ baseUrl, dryRun, log, timeoutMs = 10_000,
       return write('PATCH', `/spool/${spoolId}`, body);
     },
 
+    patchFilament: (filamentId, patch) => write('PATCH', `/filament/${filamentId}`, patch),
+
     async patchFilamentExtra(filamentId, extra) {
       const current = await read(`/filament/${filamentId}`);
       return write('PATCH', `/filament/${filamentId}`, { extra: { ...current.extra, ...encodeExtra(extra) } });

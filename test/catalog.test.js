@@ -72,7 +72,7 @@ test('filamentFromRfid builds a usable filament from tray data', () => {
   const f = filamentFromRfid(query(tray(3)), { vendorId: 1 });
   assert.equal(f.name, 'PLA Matte #BB3D43');
   assert.equal(f.material, 'PLA');
-  assert.equal(f.density, 1.24);
+  assert.equal(f.density, 1.32); // Bambu PLA Matte profile
   assert.equal(f.weight, 1000);
   assert.equal(f.color_hex, 'BB3D43');
   assert.deepEqual(f.extra, { bambu_filament_id: 'GFA01' });

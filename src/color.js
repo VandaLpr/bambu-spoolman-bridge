@@ -28,3 +28,21 @@ export function deltaE(a, b) {
   const [l2, a2, b2] = toLab(hb);
   return Math.hypot(l1 - l2, a1 - a2, b1 - b2);
 }
+
+// A Spoolman filament's colours: color_hex, or multi_color_hexes for a multi-colour filament.
+export function filamentColors(filament) {
+  if (filament?.multi_color_hexes) return filament.multi_color_hexes.split(',').map(normalizeHex).filter(Boolean);
+  const hex = normalizeHex(filament?.color_hex);
+  return hex ? [hex] : [];
+}
+
+export function sameColors(a, b) {
+  return a.length > 0 && a.length === b.length && [...a].sort().join() === [...b].sort().join();
+}
+
+// Spoolman filament fields for these colours. Multi-colour filaments leave color_hex empty
+// ("the multi_color_hexes field is used instead") and need a direction.
+export function colorFields(hexes, direction = null) {
+  if (hexes.length > 1 && direction) return { color_hex: null, multi_color_hexes: hexes.join(','), multi_color_direction: direction };
+  return { color_hex: hexes[0] ?? null };
+}

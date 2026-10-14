@@ -1,16 +1,24 @@
 // HTTP API for inspection, pending sources and rejected deductions. LAN only, no auth.
 // createApp() returns the Express app so more routers (e.g. MCP in phase 2) can be mounted.
 
+import { fileURLToPath } from 'node:url';
 import express from 'express';
+import { IntakeError } from './intake.js';
+
+const ASSETS = fileURLToPath(new URL('../assets/', import.meta.url));
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
 const limitOf = (req, def) => Math.min(Math.max(Number.parseInt(req.query.limit, 10) || def, 1), 500);
 
-export function createApp({ store, health, resolvePending, requeueUsage, dryRun }) {
+export function createApp({ store, health, resolvePending, requeueUsage, intake, dryRun }) {
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: '1mb' }));
   app.use(express.urlencoded({ extended: false }));
+
+  // The bridge's icon (assets/icon.png, icon.svg) for the pages' favicon.
+  app.use('/assets', express.static(ASSETS, { maxAge: '7d' }));
+  app.get('/favicon.ico', (req, res) => res.type('png').sendFile('icon.png', { root: ASSETS, maxAge: '7d' }));
 
   app.get('/health', (req, res) => {
     const h = health();
@@ -60,13 +68,28 @@ export function createApp({ store, health, resolvePending, requeueUsage, dryRun 
   // Only for rows in needs_attention (Spoolman rejected the deduction).
   app.post('/usage/:id/requeue', answerRoute('/usage', requeueUsage));
 
+  // Body: { batch_id, apply: false|true, items: [...] }. Independent of DRY_RUN.
+  // 200 plan or result, 400 bad request, 409 batch_id reused for other items,
+  // 422 items need input (nothing written), 502 Spoolman failed mid-apply (re-post to resume).
+  app.post('/intake', async (req, res) => {
+    try {
+      const result = req.body?.apply === true ? await intake.apply(req.body) : await intake.plan(req.body);
+      res.json(result);
+    } catch (e) {
+      if (e instanceof IntakeError) return res.status(e.status).json({ error: e.message, ...e.body });
+      res.status(502).json({ error: `${e.message}. Re-post the same batch to resume; nothing is created twice.` });
+    }
+  });
+
   app.use((err, req, res, _next) => res.status(500).json({ ok: false, message: err.message }));
   return app;
 }
 
 function page(title, body) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${esc(title)}</title><style>
+<title>${esc(title)}</title>
+<link rel="icon" href="/assets/icon.svg" type="image/svg+xml"><link rel="icon" href="/assets/icon.png" type="image/png" sizes="512x512">
+<link rel="apple-touch-icon" href="/assets/icon.png"><style>
 body{font:16px/1.4 system-ui,sans-serif;max-width:32rem;margin:1rem auto;padding:0 1rem;color:#222;background:#fafafa}
 button{display:block;width:100%;padding:.8rem;margin:.4rem 0;font-size:1rem;border:1px solid #888;border-radius:.4rem;background:#fff;text-align:left}
 .note{padding:.6rem;border-radius:.4rem;background:#fff3cd}.done{background:#d1e7dd}input{padding:.6rem;font-size:1rem;width:8rem}
@@ -78,7 +101,7 @@ function pendingPage({ pending, job, dryRun, notice }) {
   const open = pending.state === 'open';
   const parts = [
     `<h1>Which spool?</h1>`,
-    `<p>${esc(job?.printer)} · ${esc(job?.task_name ?? 'unknown print')} · ${esc(pending.source_key)}<br>Reason: ${esc(pending.reason)}</p>`,
+    `<p>${esc(job?.printer ?? pending.printer)} · ${pending.kind === 'insert' ? 'spool just inserted' : esc(job?.task_name ?? 'unknown print')} · ${esc(pending.source_key)}<br>Reason: ${esc(pending.reason)}</p>`,
   ];
   if (dryRun) parts.push('<p class="note">DRY_RUN is on: answers are logged only.</p>');
   if (notice) parts.push(`<p class="note">${esc(notice)}</p>`);

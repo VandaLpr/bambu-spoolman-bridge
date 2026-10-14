@@ -11,13 +11,17 @@
 //   - a print cancelled before any progress gets no snapshot at all
 //   - at bridge startup, progress counts only if HA changed it after the print's start_time
 //
+// Pair on insert: an RFID spool put into an AMS slot outside a print (or into a slot the
+// running print doesn't use) is paired right away, the same way as at print start, and gets
+// its location. No deduction.
+//
 // Failed prints: print_progress includes the start gcode (heating, leveling, calibration,
 // purge). With current_stage, the progress at the first "printing" stage is persisted as the
 // job's baseline and only progress beyond it is deducted; never printing means 0 g.
 
 import { computeDeductions, round2 } from './deduction.js';
 import { baselineFromHistory, decide, isSignificant, startTimeDiffers, TERMINAL } from './lifecycle.js';
-import { choiceWrites, resolveSource } from './resolver.js';
+import { choiceDecision, resolveSource } from './resolver.js';
 import { activeTrayKey, formatLocation, identityFromTray, parsePrintWeight } from './sources.js';
 
 const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -44,8 +48,13 @@ export class PrinterTracker {
     sleep = realSleep,
     debounceMs = 2000,
     weightWaitMs = 60_000,
+    colorTable = () => null,
+    insertSettleMs = 5000,
+    insertMaxWaitMs = 60_000,
   }) {
     Object.assign(this, { printer, ids, store, executor, notifier, ha, config, log, loadedTrayUuids, sleep, debounceMs, weightWaitMs });
+    Object.assign(this, { colorTable, insertSettleMs, insertMaxWaitMs });
+    this.inserts = new Map(); // print_weight key -> { uuid, since, timer } while a new tray settles
     this.prefix = printer.prefix;
     this.entities = {};
     this.lastSignificant = null;
@@ -117,10 +126,10 @@ export class PrinterTracker {
   /** Resolves once everything queued (including a pending debounce) has run. */
   async idle() {
     for (;;) {
-      while (this.weightTimer) await new Promise((r) => setTimeout(r, 5));
+      while (this.weightTimer || this.insertWaiting()) await new Promise((r) => setTimeout(r, 5));
       const q = this.queue;
       await q;
-      if (q === this.queue && !this.weightTimer) return;
+      if (q === this.queue && !this.weightTimer && !this.insertWaiting()) return;
     }
   }
 
@@ -137,6 +146,7 @@ export class PrinterTracker {
     const prev = this.entities;
     this.entities = entities;
     if (!this.started) return;
+    this.watchTrays(prev, entities);
     const changed = (key) => {
       const id = this.ids[key];
       return id && prev[id] !== entities[id];
@@ -171,6 +181,7 @@ export class PrinterTracker {
     clearTimeout(this.weightTimer);
     this.weightTimer = null;
     this.clearWait();
+    for (const key of [...this.inserts.keys()]) this.cancelInsert(key);
   }
 
   clearWait() {
@@ -284,6 +295,112 @@ export class PrinterTracker {
     if (keys.length && !keys.includes(key)) {
       this.log.warn(`active tray ${key} is not in this print's print_weight (${keys.join(', ')}); usage stays with the start snapshot`);
     }
+  }
+
+  // --- pair on insert --------------------------------------------------------------
+  // The AMS reports tray_uuid first with remain = -1 and the remaining estimate about 10 s
+  // later (seen in HA history), so pairing waits until the tray has been quiet for
+  // insertSettleMs and remain is known, or insertMaxWaitMs has passed.
+
+  watchTrays(prev, entities) {
+    for (const [key, id] of this.ids.trays) {
+      if (prev[id] === entities[id]) continue;
+      const before = identityFromTray(prev[id]?.attributes).trayUuid;
+      const after = identityFromTray(entities[id]?.attributes).trayUuid;
+      if (after !== before) {
+        this.cancelInsert(key);
+        if (after) this.inserts.set(key, { uuid: after, since: Date.now(), timer: null });
+      }
+      if (this.inserts.has(key)) this.armInsert(key); // any change restarts the quiet period
+    }
+  }
+
+  insertWaiting() {
+    for (const p of this.inserts.values()) if (p.timer) return true;
+    return false;
+  }
+
+  armInsert(key) {
+    const p = this.inserts.get(key);
+    clearTimeout(p.timer);
+    p.timer = setTimeout(() => this.insertDue(key), this.insertSettleMs);
+  }
+
+  cancelInsert(key) {
+    clearTimeout(this.inserts.get(key)?.timer);
+    this.inserts.delete(key);
+  }
+
+  insertDue(key) {
+    const p = this.inserts.get(key);
+    if (!p) return;
+    p.timer = null;
+    const attrs = this.entities[this.ids.trays.get(key)]?.attributes || {};
+    const remainUnknown = attrs.remain_enabled && !(Number(attrs.remain) >= 0);
+    if (remainUnknown && Date.now() - p.since < this.insertMaxWaitMs) {
+      this.armInsert(key);
+      return;
+    }
+    this.inserts.delete(key);
+    this.enqueue('insert', () => this.handleInsert(key, p.uuid));
+  }
+
+  async handleInsert(key, uuid) {
+    const identity = identityFromTray(this.entities[this.ids.trays.get(key)]?.attributes);
+    if (identity.trayUuid !== uuid) return; // changed again: that change has its own timer
+    const job = this.activeJob();
+    if (job && this.store.getJobSources(job.id).some((s) => s.source_key === key)) {
+      this.log.info(`insert ${key}: tray_uuid ${uuid} is part of job ${job.id}; the print's own pairing applies`);
+      return;
+    }
+    const [, unit, slot] = /^AMS (\d+) Tray (\d+)$/.exec(key).map(Number);
+    const location = formatLocation(this.printer, { kind: 'ams', unit, slot });
+    const inventory = await this.executor.loadInventory();
+    const decision = resolveSource({
+      identity,
+      location,
+      inventory,
+      nearestMaxDeltaE: this.config.nearestColorMaxDeltaE,
+      colorTable: this.colorTable(),
+      estimatedSpoolIds: this.store.estimatedSpoolIds(),
+    });
+    const { spoolId } = await this.executor.applyDecision(decision);
+    let asked = null;
+    if (decision.status === 'pending') {
+      // Ask now: whoever inserts the spool is standing at the printer. Once per tray_uuid.
+      const { pending, created } = this.store.addInsertPending({
+        printer: this.prefix,
+        sourceKey: key,
+        trayUuid: uuid,
+        reason: decision.reason,
+        candidates: decision.candidates,
+        context: { identity, location },
+      });
+      asked = { id: pending.id, created };
+      if (created) {
+        const source = { material: identity.material, name: identity.name, color_hex: identity.colorHex };
+        await this.notifier.pending({ pending, printerName: this.printer.name, taskName: null, source, inserted: true });
+      }
+    }
+    this.log.info(this.describeInsert(key, identity, decision, spoolId, location, asked));
+  }
+
+  // One line per insert: tray, tray_uuid, remain%, the spool and why, and any weight correction.
+  describeInsert(key, identity, decision, spoolId, location, asked = null) {
+    const head = `${this.config.dryRun ? '[DRY RUN] ' : ''}insert ${key}: tray_uuid ${identity.trayUuid}, remain ${identity.remainPct ?? '?'}%`;
+    if (decision.status === 'pending') {
+      const ids = decision.candidates.map((c) => `#${c.spoolId}`).join(', ');
+      const question = asked?.created ? `asked (pending ${asked.id})` : `already asked about this tray_uuid (pending ${asked?.id})`;
+      return `${head} -> not paired: ${decision.reason}${ids ? ` (candidates ${ids})` : ''}; ${question}`;
+    }
+    if (decision.status === 'create') {
+      return `${head} -> ${spoolId ? `new spool #${spoolId}` : 'new spool'} auto-created from RFID${decision.filamentId ? ` (filament #${decision.filamentId})` : ''}, location ${location}`;
+    }
+    const why = { tag: 'already tagged', rfid_uuid: 'rfid_uuid', paired: 'same filament and colour', paired_code: 'same colour code', paired_nearest: 'nearest colour, filament colour corrected' }[decision.via] ?? decision.via;
+    const c = decision.correction;
+    const correction = c ? `, remaining ${c.from} -> ${c.to} g (AMS ${c.remainPct}%)` : '';
+    const moved = decision.writes.some((w) => w.op === 'patchSpool' && w.patch.location) ? `, location ${location}` : '';
+    return `${head} -> spool #${decision.spoolId} (${why})${correction}${moved}`;
   }
 
   // --- job steps -------------------------------------------------------------------
@@ -400,6 +517,8 @@ export class PrinterTracker {
         loadedTrayUuids: source.kind === 'external' ? this.loadedTrayUuids() : [],
         nearestMaxDeltaE: this.config.nearestColorMaxDeltaE,
         now,
+        colorTable: this.colorTable(),
+        estimatedSpoolIds: this.store.estimatedSpoolIds(),
       });
       let { spoolId, resolution } = await this.executor.applyDecision(decision);
       // An answer given before a re-snapshot stays in force.
@@ -409,14 +528,28 @@ export class PrinterTracker {
       this.log.info(`job ${jobId} ${source.sourceKey} (${source.grams} g) -> ${spoolId ? `spool #${spoolId}` : resolution} [${decision.via ?? decision.reason}]`);
       this.logRemainGap(identity, inventory.spools.find((s) => s.id === spoolId));
       rows.push({ ...source, location, ...identity, spoolId, resolution, decision });
-      if (decision.status === 'pending') pendingRows.push({ source, decision });
+      if (decision.status === 'pending') pendingRows.push({ source, decision, trayUuid: identity.trayUuid });
     }
     this.store.replaceJobSources(jobId, rows);
 
-    for (const { source, decision } of pendingRows) {
-      const pending = this.store.upsertPending({ jobId, sourceKey: source.sourceKey, reason: decision.reason, candidates: decision.candidates });
+    for (const { source, decision, trayUuid } of pendingRows) {
+      const pending = this.store.upsertPending({
+        jobId,
+        sourceKey: source.sourceKey,
+        reason: decision.reason,
+        candidates: decision.candidates,
+        printer: this.prefix,
+        trayUuid,
+      });
       const signature = `${pending.reason}:${pending.candidates.map((c) => c.spoolId).join(',')}`;
       if (pending.state !== 'open' || this.notified.get(pending.id) === signature) continue;
+      // Same spool already asked about at insert and not answered yet: that answer covers this too.
+      const inserted = trayUuid ? this.store.getInsertPending(trayUuid) : null;
+      if (inserted?.state === 'open') {
+        this.notified.set(pending.id, signature);
+        this.log.info(`job ${jobId} ${source.sourceKey}: already asked when the spool was inserted (pending ${inserted.id}); not asking again`);
+        continue;
+      }
       this.notified.set(pending.id, signature);
       const sourceRow = this.store.getJobSources(jobId).find((s) => s.source_key === source.sourceKey);
       await this.notifier.pending({ pending, printerName: this.printer.name, taskName: job.task_name, source: sourceRow });
@@ -501,6 +634,7 @@ export async function resolvePending({ store, spoolman, executor, log, pendingId
   const pending = store.getPending(pendingId);
   if (!pending) return { ok: false, message: `pending ${pendingId} not found` };
   if (pending.state !== 'open') return { ok: false, message: `pending ${pendingId} is already ${pending.state}` };
+  if (pending.kind === 'insert') return resolveInsertPending({ store, spoolman, executor, log, pending, spoolId });
   const usage = store.getUsageFor(pending.job_id, pending.source_key);
 
   if (spoolId == null) {
@@ -518,13 +652,42 @@ export async function resolvePending({ store, spoolman, executor, log, pendingId
   } catch (e) {
     return { ok: false, message: `spool #${spoolId} not found in Spoolman (${e.message})` };
   }
-  await executor.runWrites(choiceWrites({ spool, identity: identityFromSourceRow(source), location: source.location }));
+  await executor.applyDecision(choiceDecision({ spool, identity: identityFromSourceRow(source), location: source.location }));
   store.setSourceResolution(pending.job_id, pending.source_key, { spoolId, resolution: 'chosen' });
   store.closePending(pendingId, 'resolved', spoolId);
+  // The same spool may also have been asked about when it was inserted: that's answered now.
+  const inserted = source.tray_uuid ? store.getInsertPending(source.tray_uuid) : null;
+  if (inserted?.state === 'open') store.closePending(inserted.id, 'resolved', spoolId);
   if (usage?.write_state === 'parked') {
     store.setUsageState(usage.id, 'queued', { spoolId });
     await executor.processQueue();
   }
   log.info(`pending ${pendingId} resolved: ${pending.source_key} of job ${pending.job_id} -> spool #${spoolId}`);
   return { ok: true, message: usage ? `Spool #${spoolId} chosen; ${usage.grams} g deducted.` : `Spool #${spoolId} chosen; it will be deducted when the print ends.` };
+}
+
+// Answer to "which spool did you just insert?": pair the tray with it (no deduction), then
+// answer any open print question about the same spool the same way.
+async function resolveInsertPending({ store, spoolman, executor, log, pending, spoolId }) {
+  if (spoolId == null) {
+    store.closePending(pending.id, 'skipped');
+    log.info(`pending ${pending.id} (insert ${pending.source_key}) skipped`);
+    return { ok: true, message: 'Skipped: the spool stays unpaired.' };
+  }
+  let spool;
+  try {
+    spool = await spoolman.getSpool(spoolId);
+  } catch (e) {
+    return { ok: false, message: `spool #${spoolId} not found in Spoolman (${e.message})` };
+  }
+  const { identity, location } = pending.context;
+  const decision = choiceDecision({ spool, identity, location, estimatedSpoolIds: store.estimatedSpoolIds() });
+  await executor.applyDecision(decision);
+  store.closePending(pending.id, 'resolved', spoolId);
+  const c = decision.correction;
+  log.info(`pending ${pending.id} resolved: ${pending.source_key} (tray_uuid ${pending.tray_uuid}) paired with spool #${spoolId}${c ? `, remaining ${c.from} -> ${c.to} g` : ''}`);
+  for (const p of store.openPrintPendingsFor(pending.tray_uuid)) {
+    await resolvePending({ store, spoolman, executor, log, pendingId: p.id, spoolId });
+  }
+  return { ok: true, message: `Spool #${spoolId} paired with ${pending.source_key}${c ? `; remaining set to ${c.to} g from the AMS estimate` : ''}.` };
 }

@@ -71,7 +71,7 @@ test('updateJobMeta keeps known values when HA reports unknown', () => {
   assert.equal(job.start_time, '2026-10-12T22:18:59+00:00');
 });
 
-test('a v1 database is migrated to v4: attempts, started_at, stage_tracked, print_baseline', async () => {
+test('a v1 database is migrated to v6: attempts, started_at, stage tracking, intake, pending kinds', async () => {
   const { mkdtempSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -82,10 +82,15 @@ test('a v1 database is migrated to v4: attempts, started_at, stage_tracked, prin
   v2.db.exec('ALTER TABLE jobs DROP COLUMN started_at');
   v2.db.exec('ALTER TABLE jobs DROP COLUMN stage_tracked');
   v2.db.exec('ALTER TABLE jobs DROP COLUMN print_baseline');
+  v2.db.exec('DROP INDEX pending_insert_tray');
+  for (const c of ['kind', 'printer', 'tray_uuid', 'context']) v2.db.exec(`ALTER TABLE pending DROP COLUMN ${c}`);
+  v2.db.exec('DROP TABLE intake_spools');
+  v2.db.exec('DROP TABLE intake_batches');
   v2.db.pragma('user_version = 1');
   v2.close();
   const migrated = openStore(file);
-  assert.equal(migrated.db.pragma('user_version', { simple: true }), 4);
+  assert.equal(migrated.db.pragma('user_version', { simple: true }), 6);
+  assert.equal(migrated.beginIntakeBatch('b1', 'h'), true);
   const jobId = migrated.createJob({ printer: 'p2s', startedAt: '2026-10-13T21:10:59.844Z', dryRun: false });
   assert.equal(migrated.getJob(jobId).started_at, '2026-10-13T21:10:59.844Z');
   assert.equal(migrated.getJob(jobId).stage_tracked, 0);
@@ -104,4 +109,51 @@ test('the printing baseline is written once and survives later returns to printi
   assert.equal(store.getJob(jobId).print_baseline, 60);
   store.setStageTracking(jobId, false);
   assert.deepEqual([store.getJob(jobId).stage_tracked, store.getJob(jobId).print_baseline], [0, null]);
+});
+
+test('intake spools: weighed ones never count as estimated; a correction is recorded once', () => {
+  assert.equal(store.beginIntakeBatch('order-1', 'h1'), true);
+  assert.equal(store.beginIntakeBatch('order-1', 'h1'), false); // already there
+  store.recordIntakeSpool({ batchId: 'order-1', itemIndex: 0, unitIndex: 0, spoolId: 10, weighed: false });
+  store.recordIntakeSpool({ batchId: 'order-1', itemIndex: 0, unitIndex: 1, spoolId: 11, weighed: true });
+  store.recordIntakeSpool({ batchId: 'order-1', itemIndex: 0, unitIndex: 0, spoolId: 99, weighed: false }); // ignored: unit recorded
+  assert.deepEqual(store.intakeSpools('order-1').map((r) => r.spool_id), [10, 11]);
+  assert.deepEqual([...store.estimatedSpoolIds()], [10]);
+  store.markRemainingCorrected(10);
+  assert.deepEqual([...store.estimatedSpoolIds()], []);
+  store.finishIntakeBatch('order-1');
+  assert.equal(store.getIntakeBatch('order-1').state, 'applied');
+});
+
+test('v5 -> v6 keeps existing print questions and fills in printer and tray_uuid', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'bsb-'));
+  const file = join(dir, 'bridge.db');
+  const s = openStore(file);
+  const jobId = s.createJob({ printer: 'p2s', dryRun: false });
+  s.replaceJobSources(jobId, [{ sourceKey: 'AMS 1 Tray 3', grams: 1, kind: 'ams', unit: 1, slot: 3, trayUuid: 'ABCD' }]);
+  s.upsertPending({ jobId, sourceKey: 'AMS 1 Tray 3', reason: 'ambiguous_pairing', candidates: [{ spoolId: 4 }] });
+  s.db.exec('DROP INDEX pending_insert_tray');
+  for (const c of ['kind', 'printer', 'tray_uuid', 'context']) s.db.exec(`ALTER TABLE pending DROP COLUMN ${c}`);
+  s.db.pragma('user_version = 5');
+  s.close();
+  const migrated = openStore(file);
+  const [p] = migrated.listPending();
+  assert.deepEqual([p.kind, p.job_id, p.printer, p.tray_uuid, p.reason, p.candidates], ['print', jobId, 'p2s', 'ABCD', 'ambiguous_pairing', [{ spoolId: 4 }]]);
+  migrated.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('an inserted spool is asked about once per tray_uuid, whatever the answer was', () => {
+  const ask = () =>
+    store.addInsertPending({ printer: 'p2s', sourceKey: 'AMS 1 Tray 3', trayUuid: 'ABCD', reason: 'ambiguous_pairing', candidates: [{ spoolId: 4 }], context: { location: 'x' } });
+  const first = ask();
+  assert.equal(first.created, true);
+  assert.deepEqual([first.pending.kind, first.pending.job_id, first.pending.context], ['insert', null, { location: 'x' }]);
+  assert.equal(ask().created, false);
+  store.closePending(first.pending.id, 'skipped');
+  assert.equal(ask().created, false);
+  assert.equal(store.getInsertPending('ABCD').state, 'skipped');
 });

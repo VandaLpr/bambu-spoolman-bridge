@@ -49,6 +49,8 @@ export function identityFromTray(attributes = {}) {
     trayUuid: isZeroId(attributes.tray_uuid) ? null : attributes.tray_uuid.toUpperCase(),
     filamentId: attributes.filament_id || null,
     colorHex: normalizeHex(attributes.color),
+    // every colour of a multi-colour spool (ha-bambulab's cols); one entry otherwise
+    colorHexes: (attributes.cols || []).map(normalizeHex).filter(Boolean),
     material,
     name: attributes.name && attributes.name !== '?' ? attributes.name : null,
     remainPct: attributes.remain_enabled && remain >= 0 ? remain : null,

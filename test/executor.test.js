@@ -249,3 +249,21 @@ test('requeue: a rejected deduction can go to another spool, or be skipped', asy
   assert.equal((await executor.requeue(id2, null)).ok, true);
   assert.equal(store.getUsage(id2).write_state, 'skipped');
 });
+
+test('an AMS estimate correction is marked done only when really written', async () => {
+  const decision = { status: 'resolved', via: 'paired_code', spoolId: 1, writes: [{ op: 'patchSpool', spoolId: 1, patch: { remaining_weight: 770 } }], correction: { spoolId: 1, from: 850, to: 770, remainPct: 77 } };
+  const live = setup();
+  store.beginIntakeBatch('b', 'h');
+  store.recordIntakeSpool({ batchId: 'b', itemIndex: 0, unitIndex: 0, spoolId: 1, weighed: false });
+  await live.executor.applyDecision(decision);
+  assert.equal(store.estimatedSpoolIds().has(1), false);
+  assert.equal(live.spoolman.db.spools[0].remaining_weight, 770);
+});
+
+test('in DRY_RUN the correction stays pending', async () => {
+  const dry = setup({ dryRun: true });
+  store.beginIntakeBatch('b', 'h');
+  store.recordIntakeSpool({ batchId: 'b', itemIndex: 0, unitIndex: 0, spoolId: 1, weighed: false });
+  await dry.executor.applyDecision({ status: 'resolved', via: 'paired', spoolId: 1, writes: [], correction: { spoolId: 1, from: 850, to: 770, remainPct: 77 } });
+  assert.equal(store.estimatedSpoolIds().has(1), true);
+});

@@ -21,7 +21,63 @@
 
 import Database from 'better-sqlite3';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 6;
+
+// Pending v6: a question is either about a print source (kind 'print', tied to a job) or about
+// a spool just inserted into an AMS slot (kind 'insert', no job; context holds the tray identity
+// and location). There is at most one insert question per tray_uuid, ever, so the same spool
+// is never asked about twice. SQLite can't drop NOT NULL in place, so the table is rebuilt.
+const PENDING_V6 = `
+CREATE TABLE pending_v6 (
+  id              INTEGER PRIMARY KEY,
+  kind            TEXT NOT NULL DEFAULT 'print' CHECK (kind IN ('print', 'insert')),
+  job_id          INTEGER REFERENCES jobs (id),
+  printer         TEXT,
+  source_key      TEXT NOT NULL,
+  tray_uuid       TEXT,
+  context         TEXT,
+  reason          TEXT NOT NULL,
+  candidates      TEXT NOT NULL,
+  state           TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'resolved', 'skipped')),
+  chosen_spool_id INTEGER,
+  created_at      TEXT NOT NULL,
+  resolved_at     TEXT,
+  UNIQUE (job_id, source_key)
+);
+INSERT INTO pending_v6 (id, kind, job_id, printer, source_key, tray_uuid, reason, candidates, state, chosen_spool_id, created_at, resolved_at)
+  SELECT p.id, 'print', p.job_id, j.printer, p.source_key, s.tray_uuid, p.reason, p.candidates, p.state, p.chosen_spool_id, p.created_at, p.resolved_at
+  FROM pending p
+  LEFT JOIN jobs j ON j.id = p.job_id
+  LEFT JOIN job_sources s ON s.job_id = p.job_id AND s.source_key = p.source_key;
+DROP TABLE pending;
+ALTER TABLE pending_v6 RENAME TO pending;
+CREATE UNIQUE INDEX pending_insert_tray ON pending (tray_uuid) WHERE kind = 'insert';
+`;
+
+// Intake (v5): a batch is identified by its id and the hash of its items, so re-posting it
+// never creates duplicates. intake_spools.weighed = 0 marks spools imported without a measured
+// remaining_weight: only those may take the AMS remain% estimate when first paired.
+const INTAKE_SCHEMA = `
+CREATE TABLE intake_batches (
+  id           TEXT PRIMARY KEY,
+  content_hash TEXT NOT NULL,
+  state        TEXT NOT NULL CHECK (state IN ('applying', 'applied')),
+  created_at   TEXT NOT NULL,
+  applied_at   TEXT
+);
+
+CREATE TABLE intake_spools (
+  batch_id             TEXT NOT NULL REFERENCES intake_batches (id),
+  item_index           INTEGER NOT NULL,
+  unit_index           INTEGER NOT NULL,
+  spool_id             INTEGER NOT NULL,
+  weighed              INTEGER NOT NULL,
+  remaining_corrected_at TEXT,
+  created_at           TEXT NOT NULL,
+  PRIMARY KEY (batch_id, item_index, unit_index)
+);
+CREATE INDEX intake_spools_spool ON intake_spools (spool_id);
+`;
 
 const SCHEMA = `
 CREATE TABLE jobs (
@@ -101,7 +157,7 @@ export function openStore(file) {
   migrate(db);
 
   const stmt = (sql) => db.prepare(sql);
-  const parsePending = (row) => row && { ...row, candidates: JSON.parse(row.candidates) };
+  const parsePending = (row) => row && { ...row, candidates: JSON.parse(row.candidates), context: row.context ? JSON.parse(row.context) : null };
 
   const q = {
     insertJob: stmt(`INSERT INTO jobs (printer, task_name, start_time, started_at, state, adopted, stage_tracked, dry_run, created_at)
@@ -145,16 +201,30 @@ export function openStore(file) {
     listUsage: stmt(`SELECT * FROM usage_log ORDER BY id DESC LIMIT ?`),
     usageForJob: stmt(`SELECT * FROM usage_log WHERE job_id = ? ORDER BY source_key`),
 
-    insertPending: stmt(`INSERT INTO pending (job_id, source_key, reason, candidates, created_at)
-                         VALUES (@jobId, @sourceKey, @reason, @candidates, @ts)
+    insertPending: stmt(`INSERT INTO pending (kind, job_id, printer, source_key, tray_uuid, reason, candidates, created_at)
+                         VALUES ('print', @jobId, @printer, @sourceKey, @trayUuid, @reason, @candidates, @ts)
                          ON CONFLICT (job_id, source_key) DO UPDATE SET reason = excluded.reason, candidates = excluded.candidates
                          WHERE pending.state = 'open'`),
     pendingFor: stmt(`SELECT * FROM pending WHERE job_id = ? AND source_key = ?`),
+    insertInsertPending: stmt(`INSERT INTO pending (kind, printer, source_key, tray_uuid, context, reason, candidates, created_at)
+                               VALUES ('insert', @printer, @sourceKey, @trayUuid, @context, @reason, @candidates, @ts)
+                               ON CONFLICT (tray_uuid) WHERE kind = 'insert' DO NOTHING`),
+    insertPendingFor: stmt(`SELECT * FROM pending WHERE kind = 'insert' AND tray_uuid = ?`),
+    openPrintPendingsFor: stmt(`SELECT * FROM pending WHERE kind = 'print' AND tray_uuid = ? AND state = 'open' ORDER BY id`),
     pending: stmt(`SELECT * FROM pending WHERE id = ?`),
     listPending: stmt(`SELECT * FROM pending WHERE state = ? ORDER BY id DESC`),
     closePending: stmt(`UPDATE pending SET state = @state, chosen_spool_id = @spoolId, resolved_at = @ts
                         WHERE id = @id AND state = 'open'`),
     dropOpenPending: stmt(`DELETE FROM pending WHERE job_id = ? AND source_key = ? AND state = 'open'`),
+
+    intakeBatch: stmt(`SELECT * FROM intake_batches WHERE id = ?`),
+    beginIntakeBatch: stmt(`INSERT OR IGNORE INTO intake_batches (id, content_hash, state, created_at) VALUES (@id, @hash, 'applying', @ts)`),
+    finishIntakeBatch: stmt(`UPDATE intake_batches SET state = 'applied', applied_at = @ts WHERE id = @id`),
+    intakeSpools: stmt(`SELECT * FROM intake_spools WHERE batch_id = ? ORDER BY item_index, unit_index`),
+    insertIntakeSpool: stmt(`INSERT OR IGNORE INTO intake_spools (batch_id, item_index, unit_index, spool_id, weighed, created_at)
+                             VALUES (@batchId, @itemIndex, @unitIndex, @spoolId, @weighed, @ts)`),
+    estimatedSpools: stmt(`SELECT spool_id FROM intake_spools WHERE weighed = 0 AND remaining_corrected_at IS NULL`),
+    markCorrected: stmt(`UPDATE intake_spools SET remaining_corrected_at = @ts WHERE spool_id = @spoolId`),
   };
 
   return {
@@ -235,14 +305,35 @@ export function openStore(file) {
     listUsage: (limit = 100) => q.listUsage.all(limit),
     usageForJob: (jobId) => q.usageForJob.all(jobId),
 
-    upsertPending({ jobId, sourceKey, reason, candidates }) {
-      q.insertPending.run({ jobId, sourceKey, reason, candidates: JSON.stringify(candidates), ts: now() });
+    upsertPending({ jobId, sourceKey, reason, candidates, printer = null, trayUuid = null }) {
+      q.insertPending.run({ jobId, printer, sourceKey, trayUuid, reason, candidates: JSON.stringify(candidates), ts: now() });
       return parsePending(q.pendingFor.get(jobId, sourceKey));
     },
+    // A question about a just-inserted spool. created is false when this tray_uuid was
+    // already asked about (open, answered or skipped): it is never asked twice.
+    addInsertPending({ printer, sourceKey, trayUuid, reason, candidates, context }) {
+      const info = q.insertInsertPending.run({
+        printer, sourceKey, trayUuid, reason, candidates: JSON.stringify(candidates), context: JSON.stringify(context), ts: now(),
+      });
+      return { pending: parsePending(q.insertPendingFor.get(trayUuid)), created: info.changes > 0 };
+    },
+    getInsertPending: (trayUuid) => parsePending(q.insertPendingFor.get(trayUuid)),
+    openPrintPendingsFor: (trayUuid) => q.openPrintPendingsFor.all(trayUuid).map(parsePending),
     getPending: (id) => parsePending(q.pending.get(id)),
     getPendingFor: (jobId, sourceKey) => parsePending(q.pendingFor.get(jobId, sourceKey)),
     listPending: (state = 'open') => q.listPending.all(state).map(parsePending),
     closePending: (id, state, spoolId = null) => q.closePending.run({ id, state, spoolId, ts: now() }).changes > 0,
+
+    getIntakeBatch: (id) => q.intakeBatch.get(id),
+    // false when the batch already exists (caller compares content_hash)
+    beginIntakeBatch: (id, hash) => q.beginIntakeBatch.run({ id, hash, ts: now() }).changes > 0,
+    finishIntakeBatch: (id) => q.finishIntakeBatch.run({ id, ts: now() }),
+    intakeSpools: (batchId) => q.intakeSpools.all(batchId),
+    recordIntakeSpool: ({ batchId, itemIndex, unitIndex, spoolId, weighed }) =>
+      q.insertIntakeSpool.run({ batchId, itemIndex, unitIndex, spoolId, weighed: bool(weighed), ts: now() }),
+    // Spools imported without a weighed remaining_weight and not corrected from the AMS yet.
+    estimatedSpoolIds: () => new Set(q.estimatedSpools.all().map((r) => r.spool_id)),
+    markRemainingCorrected: (spoolId) => q.markCorrected.run({ spoolId, ts: now() }),
   };
 }
 
@@ -258,6 +349,8 @@ function migrate(db) {
       db.exec(`ALTER TABLE jobs ADD COLUMN stage_tracked INTEGER NOT NULL DEFAULT 0`);
       db.exec(`ALTER TABLE jobs ADD COLUMN print_baseline REAL`);
     }
+    if (version < 5) db.exec(INTAKE_SCHEMA);
+    if (version < 6) db.exec(PENDING_V6);
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
   })();
 }

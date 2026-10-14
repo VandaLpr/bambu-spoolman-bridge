@@ -3,16 +3,18 @@
 // The executor performs the writes (or logs them in DRY_RUN).
 //
 // Decisions:
-//   { status: 'resolved', via, spoolId, writes }
+//   { status: 'resolved', via, spoolId, writes, correction? }
+//     correction: { spoolId, from, to, remainPct } when an intake spool took the AMS estimate
 //   { status: 'create',   via: 'created', filamentId, filamentQuery, spool, tagUid }
 //   { status: 'pending',  reason, candidates: [{ spoolId, label }] }
 //
 // Write ops:
 //   { op: 'patchSpool', spoolId, patch, extra }   extra is merged into the spool's existing extra
 //   { op: 'linkTag', spoolId, uid, format }
+//   { op: 'patchFilament', filamentId, patch }
 
 import { CREATED_COMMENT, findExistingFilament } from './catalog.js';
-import { deltaE, normalizeHex } from './color.js';
+import { deltaE, filamentColors, sameColors } from './color.js';
 import { readExtra } from './spoolman/extra.js';
 
 const MAX_CANDIDATES = 5;
@@ -21,7 +23,9 @@ const upper = (v) => (typeof v === 'string' && v ? v.toUpperCase() : null);
 const rfidOf = (spool) => upper(readExtra(spool, 'rfid_uuid'));
 const tagUids = (spool) => (spool.tags || []).map((t) => upper(t.uid));
 const filamentIdOf = (spool) => readExtra(spool.filament, 'bambu_filament_id');
-const colorOf = (spool) => normalizeHex(spool.filament?.color_hex);
+const colorCodeOf = (spool) => readExtra(spool.filament, 'bambu_color_code');
+// The first colour; for a multi-colour filament that's the first of multi_color_hexes.
+const colorOf = (spool) => filamentColors(spool.filament)[0] ?? null;
 const isOpened = (spool) => Boolean(spool.first_used);
 const isAvailable = (spool) => !spool.archived && (spool.remaining_weight == null || spool.remaining_weight > 0);
 const isRfidBound = (spool) => Boolean(rfidOf(spool)) || tagUids(spool).length > 0;
@@ -51,15 +55,29 @@ const pending = (reason, spools) => ({
  * @param {string[]} [p.loadedTrayUuids] tray_uuids currently sitting in any AMS
  * @param {number} [p.nearestMaxDeltaE]
  * @param {string} [p.now] ISO timestamp used for first_used
+ * @param {object|null} [p.colorTable]  Bambu colour codes (bambu/colors.js); pairing by code needs it
+ * @param {Set<number>} [p.estimatedSpoolIds] intake spools imported without a weighed remaining_weight
  */
-export function resolveSource({ identity, location, inventory, loadedTrayUuids = [], nearestMaxDeltaE = 20, now }) {
-  const ctx = { identity, location, inventory, now: now || new Date().toISOString(), nearestMaxDeltaE };
+export function resolveSource({
+  identity,
+  location,
+  inventory,
+  loadedTrayUuids = [],
+  nearestMaxDeltaE = 20,
+  now,
+  colorTable = null,
+  estimatedSpoolIds = new Set(),
+}) {
+  const ctx = { identity, location, inventory, now: now || new Date().toISOString(), nearestMaxDeltaE, colorTable, estimatedSpoolIds };
   ctx.loaded = new Set(loadedTrayUuids.map(upper).filter(Boolean));
   return identity.trayUuid ? resolveRfid(ctx) : resolveByFilament(ctx);
 }
 
+// Same filament id and colour; a multi-colour tray (several cols) matches on the set of colours.
 function matchesFilament(spool, identity) {
-  return Boolean(identity.filamentId) && filamentIdOf(spool) === identity.filamentId && colorOf(spool) === identity.colorHex;
+  if (!identity.filamentId || filamentIdOf(spool) !== identity.filamentId) return false;
+  const many = identity.colorHexes?.length > 1;
+  return many ? sameColors(filamentColors(spool.filament), identity.colorHexes) : colorOf(spool) === identity.colorHex;
 }
 
 function locationPatch(spool, location) {
@@ -100,31 +118,59 @@ function resolveRfid(ctx) {
     };
   }
 
-  // 3. First-time pairing: an unbound spool of the same filament and color.
-  //    Among unopened spools the lowest id wins on purpose: FIFO, oldest stock first.
-  const pool = spools.filter((s) => isAvailable(s) && !isRfidBound(s) && matchesFilament(s, identity)).sort(byId);
-  const opened = pool.filter(isOpened);
-  if (opened.length > 1) return pending('ambiguous_pairing', opened);
-  const target = opened[0] || pool[0];
-  if (target) {
-    const patch = { ...locationPatch(target, location), ...(isOpened(target) ? {} : { first_used: ctx.now }) };
-    return {
-      status: 'resolved',
-      via: 'paired',
-      spoolId: target.id,
-      writes: [...patchOp(target.id, patch, { rfid_uuid: uid }), linkTagOp(target.id, uid)],
-    };
+  // First-time pairing of an unbound spool (e.g. one imported via intake), before any
+  // auto-create so a shelf spool is never duplicated.
+  const unbound = spools.filter((s) => isAvailable(s) && !isRfidBound(s));
+
+  // 3. Same filament id and exact colour.
+  const exact = unbound.filter((s) => matchesFilament(s, identity));
+  if (exact.length) return pairWith(ctx, exact, 'paired');
+
+  // 4. Same Bambu colour code: the RFID's (filament id, colour) -> code via BambuStudio's table.
+  //    Catches filaments whose color_hex came from elsewhere (e.g. SpoolmanDB).
+  const entry = ctx.colorTable?.byFilamentAndHex(identity.filamentId, identity.colorHex, identity.colorHexes) ?? null;
+  const code = entry?.code ?? null;
+  if (code) {
+    const sameCode = unbound.filter((s) => colorCodeOf(s) === code);
+    if (sameCode.length) return pairWith(ctx, sameCode, 'paired_code');
   }
 
-  // 4. Unknown spool: create it, reusing an existing filament when there is one.
+  // 5. Nearest colour among unbound spools of the same filament id, only if exactly one
+  //    filament is close enough. A filament with a different known colour code is another
+  //    colour, however close. The filament's color_hex is corrected to what the RFID reports.
+  if (identity.filamentId) {
+    const near = unbound.filter(
+      (s) =>
+        filamentIdOf(s) === identity.filamentId &&
+        deltaE(colorOf(s), identity.colorHex) <= ctx.nearestMaxDeltaE &&
+        !(code && colorCodeOf(s) && colorCodeOf(s) !== code),
+    );
+    const filamentIds = new Set(near.map((s) => s.filament.id));
+    if (filamentIds.size > 1) return pending('ambiguous_pairing_color', near.sort(byId));
+    if (filamentIds.size === 1) {
+      const decision = pairWith(ctx, near, 'paired_nearest');
+      if (decision.status === 'resolved' && colorOf(near[0]) !== identity.colorHex) {
+        decision.writes.push({ op: 'patchFilament', filamentId: near[0].filament.id, patch: { color_hex: identity.colorHex } });
+      }
+      return decision;
+    }
+  }
+
+  // 6. Unknown spool: create it, reusing an existing filament when there is one.
   //    The executor runs planFilament() again right before creating, against fresh data.
-  const filament = findExistingFilament(inventory.filaments, identity);
+  const filament = findExistingFilament(inventory.filaments, { ...identity, colorCode: code });
   const { trayWeight, remainPct } = identity;
   return {
     status: 'create',
     via: 'created',
     filamentId: filament?.id ?? null,
-    filamentQuery: filament ? null : pickQuery(identity),
+    filamentQuery: filament
+      ? null
+      : {
+          ...pickQuery(identity),
+          colorCode: code,
+          ...(entry?.direction ? { colorHexes: entry.hexes, colorDirection: entry.direction } : {}),
+        },
     spool: {
       initial_weight: trayWeight ?? undefined,
       remaining_weight: trayWeight && remainPct != null ? Math.round((trayWeight * remainPct) / 100) : undefined,
@@ -137,16 +183,64 @@ function resolveRfid(ctx) {
   };
 }
 
-// Writes for a spool the user picked for a pending source: location, first_used when it
-// was unopened, and for an RFID tray the pairing (rfid_uuid + tag) so it resolves itself next time.
-export function choiceWrites({ spool, identity, location, now = new Date().toISOString() }) {
-  const patch = { ...locationPatch(spool, location), ...(isOpened(spool) ? {} : { first_used: now }) };
+// Pairs the RFID tray with one of equivalent unbound spools: the only opened one, or the
+// lowest-id unopened one (FIFO, oldest stock first). Several opened = ask.
+function pairWith(ctx, pool, via) {
+  const { identity, location } = ctx;
+  const sorted = [...pool].sort(byId);
+  const opened = sorted.filter(isOpened);
+  if (opened.length > 1) return pending('ambiguous_pairing', opened);
+  const target = opened[0] || sorted[0];
   const uid = identity.trayUuid;
-  if (!uid) return patchOp(spool.id, patch);
-  const writes = patchOp(spool.id, patch, rfidOf(spool) === uid ? null : { rfid_uuid: uid });
-  if (!tagUids(spool).includes(uid)) writes.push(linkTagOp(spool.id, uid));
-  return writes;
+  const correction = remainingCorrection(ctx, target);
+  const patch = {
+    ...locationPatch(target, location),
+    ...(isOpened(target) ? {} : { first_used: ctx.now }),
+    ...(correction ? { remaining_weight: correction.to } : {}),
+  };
+  return {
+    status: 'resolved',
+    via,
+    spoolId: target.id,
+    writes: [...patchOp(target.id, patch, { rfid_uuid: uid }), linkTagOp(target.id, uid)],
+    ...(correction ? { correction } : {}),
+  };
 }
+
+// An intake spool imported without a weighed remaining_weight is assumed full. When it is
+// paired and the AMS estimates it below 95%, take the estimate. Never for a weighed spool
+// and never once anything was deducted from it.
+export const ESTIMATE_BELOW_PCT = 95;
+function remainingCorrection(ctx, spool) {
+  const { identity, estimatedSpoolIds } = ctx;
+  if (!estimatedSpoolIds.has(spool.id)) return null;
+  if (Math.abs(Number(spool.used_weight) || 0) > 0.01) return null;
+  const { remainPct, trayWeight } = identity;
+  if (remainPct == null || remainPct >= ESTIMATE_BELOW_PCT || !trayWeight) return null;
+  return { spoolId: spool.id, from: spool.remaining_weight, to: Math.round((trayWeight * remainPct) / 100), remainPct };
+}
+
+// A spool the user picked for a pending source, as a decision: location, first_used when it
+// was unopened, and for an RFID tray the pairing (rfid_uuid + tag) so it resolves itself next
+// time, plus the AMS estimate for an intake spool without a weighed weight.
+export function choiceDecision({ spool, identity, location, now = new Date().toISOString(), estimatedSpoolIds = new Set() }) {
+  const uid = identity.trayUuid;
+  const correction = uid ? remainingCorrection({ identity, estimatedSpoolIds }, spool) : null;
+  const patch = {
+    ...locationPatch(spool, location),
+    ...(isOpened(spool) ? {} : { first_used: now }),
+    ...(correction ? { remaining_weight: correction.to } : {}),
+  };
+  let writes;
+  if (!uid) writes = patchOp(spool.id, patch);
+  else {
+    writes = patchOp(spool.id, patch, rfidOf(spool) === uid ? null : { rfid_uuid: uid });
+    if (!tagUids(spool).includes(uid)) writes.push(linkTagOp(spool.id, uid));
+  }
+  return { status: 'resolved', via: 'chosen', spoolId: spool.id, writes, ...(correction ? { correction } : {}) };
+}
+
+export const choiceWrites = (args) => choiceDecision(args).writes;
 
 function pickQuery(identity) {
   const { filamentId, colorHex, material, name, trayWeight, nozzleTempMin, nozzleTempMax } = identity;

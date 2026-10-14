@@ -9,6 +9,8 @@ import { formatReport, missingRequired, resolveEntities } from './ha/entities.js
 import { addSecret, createLogger, setLogLevel } from './log.js';
 import { createNotifier, parseAction } from './notifier.js';
 import { createApp } from './server.js';
+import { loadColorTable } from './bambu/colors.js';
+import { createIntake } from './intake.js';
 import { createSpoolmanClient } from './spoolman/client.js';
 import { openStore } from './store.js';
 import { PrinterTracker, resolvePending } from './tracker.js';
@@ -37,6 +39,9 @@ async function main() {
   mkdirSync(config.dataDir, { recursive: true });
   const store = openStore(path.join(config.dataDir, 'bridge.db'));
   const spoolman = createSpoolmanClient({ baseUrl: config.spoolmanUrl, dryRun: config.dryRun, log: createLogger('spoolman') });
+  // Intake is user-initiated: it always writes, whatever DRY_RUN says.
+  const intakeSpoolman = createSpoolmanClient({ baseUrl: config.spoolmanUrl, dryRun: false, log: createLogger('intake') });
+  const colorTable = await loadColorTable({ ref: config.bambuColorRef, dataDir: config.dataDir, log: createLogger('bambu') });
   const status = { spoolmanOk: false, entitiesOk: false, startedAt: new Date().toISOString() };
 
   try {
@@ -87,6 +92,7 @@ async function main() {
           ha,
           config,
           loadedTrayUuids,
+          colorTable: () => colorTable,
           log: createLogger(printer.name),
         });
         trackers.push(tracker);
@@ -116,7 +122,9 @@ async function main() {
     config.spoolmanRetryMinutes * 60_000,
   );
 
+  const intake = createIntake({ spoolman: intakeSpoolman, store, colorTable: () => colorTable, config, log: createLogger('intake') });
   const app = createApp({
+    intake,
     store,
     dryRun: config.dryRun,
     resolvePending: async (pendingId, spoolId) => {

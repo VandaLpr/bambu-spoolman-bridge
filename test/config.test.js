@@ -47,3 +47,17 @@ test('extra fields are JSON-decoded on read and encoded on write', () => {
   assert.equal(readExtra({ extra: { x: 'not-json' } }, 'x'), 'not-json');
   assert.deepEqual(encodeExtra({ rfid_uuid: 'ABC', gone: null }), { rfid_uuid: '"ABC"', gone: null });
 });
+
+test('intake settings: optional tare weights and the colour table ref', () => {
+  const defaults = loadConfig(base);
+  assert.deepEqual([defaults.tareSpoolG, defaults.tareRefillG], [null, null]);
+  assert.match(defaults.bambuColorRef, /^804d93bb5d/);
+  const set = loadConfig({ ...base, TARE_SPOOL_G: '250', TARE_REFILL_G: ' ', BAMBU_COLOR_REF: 'v02.03.00.70' });
+  assert.deepEqual([set.tareSpoolG, set.tareRefillG, set.bambuColorRef], [250, null, 'v02.03.00.70']);
+  assert.throws(() => loadConfig({ ...base, TARE_SPOOL_G: 'heavy' }), /TARE_SPOOL_G/);
+});
+
+test('invalid numbers are reported (they used to be checked after the error was thrown)', () => {
+  assert.throws(() => loadConfig({ ...base, PORT: 'eighty' }), /PORT must be a non-negative number/);
+  assert.throws(() => loadConfig({ ...base, NEAREST_COLOR_MAX_DE: '-1' }), /NEAREST_COLOR_MAX_DE/);
+});

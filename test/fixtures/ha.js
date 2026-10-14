@@ -7,6 +7,8 @@ const load = (name) => JSON.parse(readFileSync(new URL(name, import.meta.url), '
 
 export const states = load('./ha-states.json');
 export const catalog = load('./catalog.json');
+// BambuStudio colour codes, reduced to the five entries reported by the author's own trays.
+export const colorCodes = load('./color-codes.json');
 
 export const tray = (n) => states[`sensor.p2s_ams_1_tray_${n}`].attributes;
 export const activeTray = states['sensor.p2s_active_tray'].attributes;

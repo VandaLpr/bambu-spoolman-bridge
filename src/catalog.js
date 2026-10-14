@@ -3,13 +3,15 @@
 // SpoolmanDB names Bambu colors plainly ("Gold"), so matching is by vendor,
 // material and exact color, narrowed by the variant word in the HA name (Matte, Silk+...).
 
-import { normalizeHex } from './color.js';
+import { densityFor } from './bambu/profiles.js';
+import { colorFields, filamentColors, normalizeHex, sameColors } from './color.js';
 import { readExtra } from './spoolman/extra.js';
 
 export const CREATED_COMMENT = 'auto-created from RFID by bridge';
 const VENDOR = 'bambu lab';
 const VARIANT_WORDS = ['matte', 'silk', 'sparkle', 'metal', 'marble', 'galaxy', 'glow', 'translucent', 'tough', 'hf', 'cf', 'gradient', 'dual', 'wood', 'aero', 'lite', 'pure', 'support'];
-const DENSITY = { PLA: 1.24, PETG: 1.27, ABS: 1.04, ASA: 1.07, TPU: 1.21, PC: 1.2, PA: 1.08, PVA: 1.23 };
+// Spoolman requires a density; it only affects length figures, never weights.
+const FALLBACK_DENSITY = 1.24;
 
 // "Bambu PLA Matte" + material PLA -> ["matte"]; "Bambu PLA Basic" -> []
 export function variantTokens(name, material) {
@@ -26,14 +28,16 @@ function entryText(e) {
   return [e.name, e.finish, e.pattern, e.translucent ? 'translucent' : '', e.glow ? 'glow' : ''].join(' ').toLowerCase();
 }
 
-// Dedupe gate. Every path that creates or imports a filament (RFID fallback now, order
-// intake later) must check local filaments first: by bambu_filament_id + color, then by
-// SpoolmanDB external_id. Lowest id wins if Spoolman already holds duplicates.
-export function findExistingFilament(filaments, { filamentId, colorHex, externalId = null }) {
-  const color = normalizeHex(colorHex);
+// Dedupe gate. Every path that creates or imports a filament (RFID fallback, intake) must
+// check local filaments first: by Bambu colour code (when known), by bambu_filament_id +
+// colour, then by SpoolmanDB external_id. Lowest id wins if Spoolman already holds duplicates.
+export function findExistingFilament(filaments, { filamentId, colorHex, colorHexes = [], colorCode = null, externalId = null }) {
+  const colors = colorHexes.length > 1 ? colorHexes : [normalizeHex(colorHex)].filter(Boolean);
   const sorted = [...filaments].sort((a, b) => a.id - b.id);
+  const byCode = colorCode ? sorted.find((f) => readExtra(f, 'bambu_color_code') === colorCode) : undefined;
+  if (byCode) return byCode;
   const byBambuId = filamentId
-    ? sorted.find((f) => readExtra(f, 'bambu_filament_id') === filamentId && normalizeHex(f.color_hex) === color)
+    ? sorted.find((f) => readExtra(f, 'bambu_filament_id') === filamentId && sameColors(filamentColors(f), colors))
     : undefined;
   if (byBambuId) return byBambuId;
   return (externalId && sorted.find((f) => f.external_id === externalId)) || null;
@@ -59,7 +63,9 @@ export function planFilament({ filaments, catalogEntries, query, vendorId }) {
         ? { use: imported }
         : { use: imported, patchExtra: { bambu_filament_id: query.filamentId } };
     }
-    return { import: filamentFromCatalog(entry, { vendorId, bambuFilamentId: query.filamentId }), entry };
+    const params = filamentFromCatalog(entry, { vendorId, bambuFilamentId: query.filamentId });
+    if (query.colorCode) params.extra.bambu_color_code = query.colorCode;
+    return { import: params, entry };
   }
   return { create: filamentFromRfid(query, { vendorId }) };
 }
@@ -70,6 +76,17 @@ export function catalogSearchQuery(query) {
 
 /** @returns {object|null} the single matching ExternalFilament entry */
 export function pickCatalogEntry(entries, query) {
+  // Multi-colour: the set of colours identifies the entry; names like "Midnight Blaze" carry
+  // no variant word, so the variant filter below doesn't apply.
+  if (query.colorHexes?.length > 1) {
+    const multi = entries.filter(
+      (e) =>
+        e.manufacturer?.toLowerCase() === VENDOR &&
+        e.material?.toUpperCase() === query.material?.toUpperCase() &&
+        sameColors((e.color_hexes || []).map(normalizeHex).filter(Boolean), query.colorHexes),
+    );
+    return multi.length === 1 ? multi[0] : null;
+  }
   const color = normalizeHex(query.colorHex);
   let matches = entries.filter(
     (e) =>
@@ -100,7 +117,7 @@ export function filamentFromCatalog(entry, { vendorId, bambuFilamentId }) {
     diameter: entry.diameter,
     weight: entry.weight,
     spool_weight: entry.spool_weight ?? undefined,
-    color_hex: normalizeHex(entry.color_hex),
+    ...colorFields(entry.color_hexes?.length ? entry.color_hexes.map(normalizeHex).filter(Boolean) : [normalizeHex(entry.color_hex)], entry.multi_color_direction ?? null),
     settings_extruder_temp: entry.extruder_temp ?? undefined,
     settings_bed_temp: entry.bed_temp ?? undefined,
     external_id: entry.id,
@@ -114,11 +131,13 @@ export function filamentFromRfid(query, { vendorId }) {
     name: `${label} #${query.colorHex}`,
     vendor_id: vendorId,
     material: query.material ?? undefined,
-    density: DENSITY[query.material?.toUpperCase()] ?? 1.24,
+    density: densityFor(query.filamentId) ?? FALLBACK_DENSITY,
     diameter: 1.75,
     weight: query.trayWeight ?? undefined,
-    color_hex: query.colorHex ?? undefined,
+    ...(query.colorHexes?.length > 1 && query.colorDirection
+      ? colorFields(query.colorHexes, query.colorDirection)
+      : { color_hex: query.colorHex ?? undefined }),
     comment: CREATED_COMMENT,
-    extra: { bambu_filament_id: query.filamentId },
+    extra: { bambu_filament_id: query.filamentId, ...(query.colorCode ? { bambu_color_code: query.colorCode } : {}) },
   };
 }
