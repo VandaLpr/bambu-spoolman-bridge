@@ -97,3 +97,22 @@ test('formatLocation applies the per-printer template', () => {
   assert.equal(formatLocation(p2s, { kind: 'ams', unit: 1, slot: 3 }), 'P2S AMS1 Slot 3');
   assert.equal(formatLocation(p2s, { kind: 'external' }), 'P2S External');
 });
+
+test('failed with current_stage: only progress after printing began counts (real 63% failure, baseline 60)', () => {
+  const { sources } = parsePrintWeight(printWeight.failedAt63);
+  assert.equal(progressFactor('failed', 63, { tracked: true, baseline: 60 }), 0.075);
+  assert.deepEqual(computeDeductions(sources, 'failed', 63, { tracked: true, baseline: 60 }), [{ sourceKey: 'AMS 1 Tray 2', grams: 0.04 }]);
+});
+
+test('failed with current_stage but never printing deducts nothing (job 5: 66% during bed leveling)', () => {
+  assert.equal(progressFactor('failed', 66, { tracked: true, baseline: null }), 0);
+  assert.deepEqual(computeDeductions([{ sourceKey: 'External Spool', grams: 0.98 }], 'failed', 66, { tracked: true, baseline: null }), []);
+});
+
+test('baseline edge cases; finish ignores the baseline; untracked jobs keep plain progress', () => {
+  assert.equal(progressFactor('failed', 50, { tracked: true, baseline: 60 }), 0); // below the baseline
+  assert.equal(progressFactor('failed', 100, { tracked: true, baseline: 100 }), 0);
+  assert.equal(progressFactor('failed', 80, { tracked: true, baseline: 40 }), 40 / 60);
+  assert.equal(progressFactor('finish', 63, { tracked: true, baseline: null }), 1);
+  assert.equal(progressFactor('failed', 63, { tracked: false, baseline: 60 }), 0.63);
+});

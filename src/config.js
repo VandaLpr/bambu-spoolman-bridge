@@ -87,7 +87,7 @@ function parsePrinters(raw, problems) {
       externalLocation: p?.externalLocation || name,
       refreshDelayMs: Number.isFinite(p?.refreshDelayMs) ? p.refreshDelayMs : 5000,
       // Optional entity id overrides, e.g. {"externalSpool": "sensor.x"}. Keys: status, progress,
-      // printWeight, startTime, taskName, activeTray, externalSpool, refreshButton (see ha/entities.js)
+      // printWeight, startTime, taskName, activeTray, stage, externalSpool, refreshButton (see ha/entities.js)
       entities: Object.freeze({ ...(p?.entities || {}) }),
     });
   });

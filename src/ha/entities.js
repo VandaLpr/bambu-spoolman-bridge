@@ -11,6 +11,8 @@ const SPEC = [
   { key: 'taskName', required: false, candidates: (p) => [`sensor.${p}_task_name`] },
   // Only printers with an AMS have it.
   { key: 'activeTray', required: false, quiet: true, candidates: (p) => [`sensor.${p}_active_tray`] },
+  // "printing" marks where real printing starts: the baseline for failed-print deductions.
+  { key: 'stage', required: false, candidates: (p) => [`sensor.${p}_current_stage`] },
   {
     key: 'externalSpool',
     required: false,

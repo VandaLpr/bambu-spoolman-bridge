@@ -18,8 +18,23 @@ function mask(text) {
   return out;
 }
 
+const pad = (n, width = 2) => String(n).padStart(width, '0');
+
+// ISO 8601 in local time with its UTC offset, e.g. 2026-10-14T10:16:44.915+02:00.
+// The zone comes from TZ (Node resolves IANA names itself, no tzdata package needed).
+export function localIso(date = new Date()) {
+  const offset = -date.getTimezoneOffset();
+  const sign = offset >= 0 ? '+' : '-';
+  const abs = Math.abs(offset);
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}` +
+    `${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`
+  );
+}
+
 function format(level, scope, msg, data) {
-  let line = `${new Date().toISOString()} ${level.toUpperCase().padEnd(5)} [${scope}] ${msg}`;
+  let line = `${localIso()} ${level.toUpperCase().padEnd(5)} [${scope}] ${msg}`;
   if (data !== undefined) {
     const detail = data instanceof Error ? data.stack || data.message : JSON.stringify(data);
     line += ` ${detail}`;

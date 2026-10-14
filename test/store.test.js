@@ -71,7 +71,7 @@ test('updateJobMeta keeps known values when HA reports unknown', () => {
   assert.equal(job.start_time, '2026-10-12T22:18:59+00:00');
 });
 
-test('a v1 database is migrated: usage_log.attempts and jobs.started_at are added', async () => {
+test('a v1 database is migrated to v4: attempts, started_at, stage_tracked, print_baseline', async () => {
   const { mkdtempSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -80,14 +80,28 @@ test('a v1 database is migrated: usage_log.attempts and jobs.started_at are adde
   const v2 = openStore(file);
   v2.db.exec('ALTER TABLE usage_log DROP COLUMN attempts');
   v2.db.exec('ALTER TABLE jobs DROP COLUMN started_at');
+  v2.db.exec('ALTER TABLE jobs DROP COLUMN stage_tracked');
+  v2.db.exec('ALTER TABLE jobs DROP COLUMN print_baseline');
   v2.db.pragma('user_version = 1');
   v2.close();
   const migrated = openStore(file);
-  assert.equal(migrated.db.pragma('user_version', { simple: true }), 3);
+  assert.equal(migrated.db.pragma('user_version', { simple: true }), 4);
   const jobId = migrated.createJob({ printer: 'p2s', startedAt: '2026-10-13T21:10:59.844Z', dryRun: false });
   assert.equal(migrated.getJob(jobId).started_at, '2026-10-13T21:10:59.844Z');
+  assert.equal(migrated.getJob(jobId).stage_tracked, 0);
+  assert.equal(migrated.getJob(jobId).print_baseline, null);
   const id = migrated.recordUsage({ jobId, printer: 'p2s', sourceKey: 'AMS 1 Tray 1', spoolId: 1, grams: 1, status: 'finish', dryRun: false, writeState: 'queued' });
   assert.equal(migrated.countUsageAttempt(id), 1);
   migrated.close();
   rmSync(dir, { recursive: true, force: true });
+});
+
+test('the printing baseline is written once and survives later returns to printing', () => {
+  const jobId = store.createJob({ printer: 'p2s', stageTracked: true, dryRun: false });
+  assert.equal(store.getJob(jobId).stage_tracked, 1);
+  assert.equal(store.setPrintBaseline(jobId, 60), true);
+  assert.equal(store.setPrintBaseline(jobId, 85), false); // e.g. printing again after a pause
+  assert.equal(store.getJob(jobId).print_baseline, 60);
+  store.setStageTracking(jobId, false);
+  assert.deepEqual([store.getJob(jobId).stage_tracked, store.getJob(jobId).print_baseline], [0, null]);
 });

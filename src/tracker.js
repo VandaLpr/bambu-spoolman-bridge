@@ -10,9 +10,13 @@
 //     persisted so a restart in between waits too; fallback: the current value after weightWaitMs)
 //   - a print cancelled before any progress gets no snapshot at all
 //   - at bridge startup, progress counts only if HA changed it after the print's start_time
+//
+// Failed prints: print_progress includes the start gcode (heating, leveling, calibration,
+// purge). With current_stage, the progress at the first "printing" stage is persisted as the
+// job's baseline and only progress beyond it is deducted; never printing means 0 g.
 
 import { computeDeductions, round2 } from './deduction.js';
-import { decide, isSignificant, startTimeDiffers, TERMINAL } from './lifecycle.js';
+import { baselineFromHistory, decide, isSignificant, startTimeDiffers, TERMINAL } from './lifecycle.js';
 import { choiceWrites, resolveSource } from './resolver.js';
 import { activeTrayKey, formatLocation, identityFromTray, parsePrintWeight } from './sources.js';
 
@@ -141,6 +145,11 @@ export class PrinterTracker {
 
     // Progress first: on finish both change in the same update.
     if (stateChanged('progress')) this.enqueue('progress', () => this.handleProgress());
+    if (stateChanged('stage')) {
+      const stage = this.state('stage');
+      const progress = this.progress(); // the jump to the baseline comes in this same update
+      this.enqueue('stage', () => this.handleStage(stage, progress));
+    }
     if (stateChanged('status')) {
       const status = this.state('status');
       this.enqueue('status', () => this.handleStatus(status));
@@ -196,6 +205,7 @@ export class PrinterTracker {
     if (action === 'continue') {
       // At runtime, progress arrives through handleProgress(); the current value may be stale.
       if (startup) this.store.raiseMaxProgress(job.id, this.trustedStartupProgress());
+      if (startup && job.stage_tracked && job.print_baseline === null) await this.restoreBaseline(job);
       if (this.store.getJobSources(job.id).length) return;
       // Jobs from before started_at was stored (null) count as fresh.
       if (this.weightIsFresh(job.started_at)) await this.snapshot(job.id);
@@ -208,6 +218,37 @@ export class PrinterTracker {
   async handleProgress() {
     const job = this.activeJob();
     if (job) this.store.raiseMaxProgress(job.id, this.progress());
+  }
+
+  async handleStage(stage, progress) {
+    if (stage !== 'printing') return;
+    const job = this.activeJob();
+    if (!job?.stage_tracked) return;
+    if (this.store.setPrintBaseline(job.id, progress)) this.log.info(`job ${job.id}: printing started at ${progress}% (failed-print baseline)`);
+  }
+
+  // After a bridge restart the first "printing" may have happened while it was down. Rebuild
+  // the baseline from HA's recorder; if that isn't possible, fall back to plain progress.
+  async restoreBaseline(job) {
+    const times = [job.start_time, job.started_at, job.created_at].map((t) => Date.parse(t)).filter(Number.isFinite);
+    const since = Math.min(...times) - this.config.jobStartToleranceSec * 1000;
+    try {
+      const history = await this.ha.history([this.ids.stage, this.ids.progress], since);
+      const { printing, baseline } = baselineFromHistory(history[this.ids.stage], history[this.ids.progress]);
+      if (printing && baseline !== null) {
+        this.store.setStageTracking(job.id, true, baseline);
+        this.log.info(`job ${job.id}: baseline ${baseline}% restored from HA history`);
+      } else if (!printing && this.state('stage') !== 'printing') {
+        this.store.setStageTracking(job.id, true, null);
+        this.log.info(`job ${job.id}: not printing yet according to HA history`);
+      } else {
+        this.store.setStageTracking(job.id, false);
+        this.log.warn(`job ${job.id}: printing baseline not in HA history; a failure is deducted by plain progress`);
+      }
+    } catch (e) {
+      this.store.setStageTracking(job.id, false);
+      this.log.warn(`job ${job.id}: HA history unavailable (${e.message ?? e}); a failure is deducted by plain progress`);
+    }
   }
 
   async handleMeta() {
@@ -272,15 +313,20 @@ export class PrinterTracker {
     // Only a print already running when the bridge starts is adopted. started_at is HA's
     // time of the status that started the job; print_weight must be newer to be this print's.
     const startedAt = this.entity('status')?.last_changed ?? null;
+    // A fresh job starts before printing; if the stage already says "printing" the start was
+    // missed and the baseline is unknown. An adopted job gets its tracking from history.
+    const stageTracked = !startup && Boolean(this.ids.stage) && this.state('stage') !== 'printing';
     const jobId = this.store.createJob({
       printer: this.prefix,
       taskName: this.value('taskName'),
       startTime: this.value('startTime'),
       startedAt,
       adopted: startup,
+      stageTracked,
       dryRun: this.config.dryRun,
     });
     if (startup) this.store.raiseMaxProgress(jobId, this.trustedStartupProgress());
+    if (startup && this.ids.stage) await this.restoreBaseline(this.store.getJob(jobId));
     this.log.info(`job ${jobId} ${startup ? 'adopted' : 'started'}: "${this.value('taskName') ?? '?'}"`);
 
     if (this.ids.refreshButton) {
@@ -387,9 +433,12 @@ export class PrinterTracker {
     if (!TERMINAL.has(status)) return;
     this.clearWait();
     if (!this.store.getJobSources(job.id).length) {
-      // Cancelled before printing anything: print_weight may still be the previous print's and
-      // nothing was used, so no snapshot, no resolution (no Spoolman writes), no usage rows.
-      if (status === 'failed' && !(this.store.getJob(job.id).max_progress > 0)) {
+      // Failed before printing anything (no progress, or the stage never reached "printing"):
+      // print_weight may still be the previous print's and nothing was used, so no snapshot,
+      // no resolution (no Spoolman writes), no usage rows.
+      const before = this.store.getJob(job.id);
+      const neverPrinted = !(before.max_progress > 0) || (before.stage_tracked && before.print_baseline === null);
+      if (status === 'failed' && neverPrinted) {
         this.store.endJob(job.id, 'failed', 0);
         this.log.info(`job ${job.id} failed before printing anything: nothing to deduct`);
         return;
@@ -403,6 +452,7 @@ export class PrinterTracker {
       sources.map((s) => ({ sourceKey: s.source_key, grams: s.grams })),
       status,
       fresh.max_progress,
+      { tracked: Boolean(fresh.stage_tracked), baseline: fresh.print_baseline },
     );
     const bySource = new Map(sources.map((s) => [s.source_key, s]));
     // Rows first, then end the job: a crash in between is repaired by the next startup.
@@ -419,7 +469,8 @@ export class PrinterTracker {
     }
     const total = round2(deductions.reduce((t, d) => t + d.grams, 0));
     this.store.endJob(job.id, status, total);
-    this.log.info(`job ${job.id} ${status} at ${fresh.max_progress}%: ${total} g over ${deductions.length} source(s)`);
+    const base = fresh.stage_tracked ? `, printing from ${fresh.print_baseline ?? 'never'}%` : '';
+    this.log.info(`job ${job.id} ${status} at ${fresh.max_progress}%${base}: ${total} g over ${deductions.length} source(s)`);
     if (!sources.length) {
       await this.notifier.problem(
         `${this.printer.name}: nothing to deduct`,

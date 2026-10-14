@@ -33,6 +33,28 @@ export function decide({ status, lastSignificant, hasActiveJob, startTimeChanged
   return 'none';
 }
 
+// The progress jump that comes with the first "printing" stage arrives in the same HA update
+// but can be stamped a few microseconds later (seen: 47 µs), hence the window.
+export const BASELINE_WINDOW_MS = 1000;
+
+/**
+ * Failed-print baseline from recorder history: the progress at the first "printing" stage.
+ * @param {{state: string, time: number}[]} stageRows     ascending
+ * @param {{state: string, time: number}[]} progressRows  ascending
+ * @returns {{ printing: boolean, baseline: number|null }}
+ */
+export function baselineFromHistory(stageRows = [], progressRows = []) {
+  const first = stageRows.find((r) => r.state === 'printing');
+  if (!first) return { printing: false, baseline: null };
+  let baseline = null;
+  for (const r of progressRows) {
+    if (r.time > first.time + BASELINE_WINDOW_MS) break;
+    const n = Number(r.state);
+    if (Number.isFinite(n)) baseline = n;
+  }
+  return { printing: true, baseline };
+}
+
 // ISO timestamps more than toleranceSec apart. Unknown values never count as a change,
 // because HA reports start_time as unknown after its own restart.
 export function startTimeDiffers(a, b, toleranceSec) {

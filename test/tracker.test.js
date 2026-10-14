@@ -32,7 +32,18 @@ const trays = () => Object.fromEntries([1, 2, 3, 4].map((n) => [`sensor.p2s_ams_
 let store;
 afterEach(() => store?.close());
 
-function rig({ printer = P2S, spools = p2sSpools(), filaments = [goldFilament, blackFil, matteRedFil], dryRun = false, initial = {}, initialAt, weightWaitMs = 60_000 } = {}) {
+function rig({
+  printer = P2S,
+  spools = p2sSpools(),
+  filaments = [goldFilament, blackFil, matteRedFil],
+  dryRun = false,
+  initial = {},
+  initialAt,
+  weightWaitMs = 60_000,
+  history = async () => {
+    throw new Error('no recorder in this test');
+  },
+} = {}) {
   store = openStore(':memory:');
   const spoolman = createFakeSpoolman({ spools, filaments, catalog, dryRun });
   const notifier = createRecordingNotifier();
@@ -49,7 +60,11 @@ function rig({ printer = P2S, spools = p2sSpools(), filaments = [goldFilament, b
   const { ids } = resolveEntities(printer, world.get());
   const warnings = [];
   const log = { ...silentLog, warn: (m) => warnings.push(m) };
-  const ha = { pressed: [], pressButton: async (id) => ha.pressed.push(id) };
+  const ha = { pressed: [], historyCalls: [], pressButton: async (id) => ha.pressed.push(id) };
+  ha.history = async (ids, since) => {
+    ha.historyCalls.push({ ids, since });
+    return history(ids, since);
+  };
   const config = { dryRun, jobStartToleranceSec: 120, nearestColorMaxDeltaE: 20 };
   const tracker = new PrinterTracker({ printer, ids, store, executor, notifier, ha, config, log, sleep: async () => {}, debounceMs: 0, weightWaitMs });
   const push = async (changes, at) => {
@@ -108,7 +123,7 @@ describe('P2S with AMS', () => {
     assert.equal(r.notifier.sent.pending.length, 0);
   });
 
-  test('failed print deducts grams x max progress (real failure at 63%)', async () => {
+  test('failed print without current_stage deducts grams x max progress (real failure at 63%)', async () => {
     const r = rig();
     await r.start();
     await r.push({ status: 'prepare', progress: '0', startTime: T1, taskName: 'Test print', printWeight: pw(printWeight.failedAt63) });
@@ -444,5 +459,218 @@ describe('replayed from HA history', () => {
     assert.equal(job.adopted, 1);
     assert.equal(job.max_progress, 0);
     assert.deepEqual(store.getJobSources(job.id).map((s) => s.grams), [0.1]);
+  });
+});
+
+// print_progress is gcode progress: the start sequence counts too. Replayed from the HA recorder.
+describe('failed prints and current_stage', () => {
+  const at = (day, time) => `2026-10-${day}T${time}Z`;
+  const replay = async (r, day, steps) => {
+    for (const [time, changes] of steps) await r.push(changes, at(day, time));
+  };
+
+  // P2S, 2026-10-12: failed at 63%, but the stage reached "printing" only at 60%.
+  const p2s63 = [
+    ['22:43:52.840', { progress: '0', status: 'prepare', startTime: '2026-10-12T22:43:00+00:00' }],
+    ['22:43:55.405', { status: 'running', startTime: '2026-10-12T22:43:49+00:00', printWeight: pw(printWeight.failedAt63) }],
+    ['22:44:02.671', { stage: 'cooling_chamber' }],
+    ['22:44:05.898', { stage: 'homing_toolhead' }],
+    ['22:45:07.396', { stage: 'identifying_build_plate_type' }],
+    ['22:45:13.374', { stage: 'changing_filament' }],
+    ['22:46:37.377', { stage: 'calibrating_extrusion' }],
+    ['22:46:54.496', { stage: 'cleaning_nozzle_tip' }],
+    ['22:48:03.358', { progress: '3' }],
+    ['22:48:05.797', { stage: 'sweeping_xy_mech_mode', progress: '5' }],
+    ['22:48:10.399', { stage: 'waiting_for_heatbed_temperature' }],
+    ['22:49:17.301', { stage: 'print_calibration_lines' }],
+    ['22:49:38.902', { stage: 'printing', progress: '60' }],
+    ['22:49:42.325', { progress: '61' }],
+    ['22:49:51.413', { progress: '62' }],
+    ['22:49:57.018', { progress: '63' }],
+    ['22:50:02.835', { stage: 'idle', status: 'failed' }],
+    ['22:50:07.813', { progress: '0' }],
+  ];
+  const p2sBefore = {
+    status: 'finish',
+    progress: '100',
+    stage: 'idle',
+    startTime: '2026-10-12T22:18:59+00:00',
+    taskName: 'Old print',
+    printWeight: pw(printWeight.fourColor),
+  };
+
+  // The same window as HA's websocket history returns it (progress 60 stamped 47 microseconds later).
+  const p2sHistory = (ids) => ({
+    [ids[0]]: [
+      { state: 'print_calibration_lines', time: Date.parse('2026-10-12T22:49:17.301Z') },
+      { state: 'printing', time: 1791845378.902699 * 1000 },
+    ],
+    [ids[1]]: [
+      { state: '5', time: Date.parse('2026-10-12T22:48:05.797Z') },
+      { state: '60', time: 1791845378.902746 * 1000 },
+      { state: '61', time: Date.parse('2026-10-12T22:49:42.325Z') },
+    ],
+  });
+
+  test('A1 job 5: cancelled at 66% during bed leveling, never printed a layer -> 0 g', async () => {
+    const r = rig({
+      printer: A1,
+      spools: [spool({ id: 20, filament: petgWhiteFil, remaining: 500, firstUsed: T1 })],
+      filaments: [petgWhiteFil],
+      initial: {
+        'sensor.a1_external_spool_external_spool': { state: 'Bambu PETG Basic', attributes: a1External },
+        status: 'finish',
+        progress: '100',
+        stage: 'idle',
+        startTime: '2026-10-13T22:08:55+00:00',
+        taskName: 'Old print',
+        printWeight: pw({ 'External Spool': 0.1 }),
+      },
+      initialAt: '2026-10-14T07:00:00.000Z',
+    });
+    await r.start();
+    await replay(r, '14', [
+      ['08:16:44.915', { status: 'prepare', startTime: '2026-10-14T08:16:00+00:00' }],
+      [
+        '08:16:54.290',
+        { stage: 'heatbed_preheating', progress: '0', status: 'running', startTime: '2026-10-14T08:16:41+00:00', printWeight: pw({ 'External Spool': 0.98 }) },
+      ],
+      ['08:17:25.963', { stage: 'homing_toolhead' }],
+      ['08:17:34.168', { stage: 'filament_loading', progress: '1' }],
+      ['08:18:54.256', { progress: '11' }],
+      ['08:18:56.315', { progress: '12' }],
+      ['08:19:04.576', { stage: 'calibrating_extrusion' }],
+      ['08:20:06.668', { progress: '16' }],
+      ['08:20:52.268', { stage: 'sweeping_xy_mech_mode' }],
+      ['08:21:17.185', { progress: '17' }],
+      ['08:21:27.559', { stage: 'cleaning_nozzle_tip' }],
+      ['08:21:31.689', { progress: '64' }],
+      ['08:21:54.284', { progress: '65' }],
+      ['08:22:00.444', { progress: '66' }],
+      ['08:22:23.010', { stage: 'auto_bed_leveling' }],
+      ['08:22:47.169', { status: 'failed' }],
+      ['08:22:52.230', { stage: 'idle', progress: '0' }],
+    ]);
+    const [job] = store.listJobs();
+    assert.deepEqual([job.state, job.total_grams, job.max_progress, job.stage_tracked, job.print_baseline], ['failed', 0, 66, 1, null]);
+    assert.deepEqual(r.usage(), []);
+    assert.equal(r.spoolman.writes('useWeight').length, 0);
+  });
+
+  test('failed with progress but never printing, before any snapshot: no snapshot, no Spoolman calls', async () => {
+    // As job 5, but print_weight never changes (identical reprint), so the 60 s wait is still open.
+    const r = rig({
+      printer: A1,
+      spools: [spool({ id: 20, filament: petgWhiteFil, remaining: 500 })],
+      filaments: [petgWhiteFil],
+      initial: {
+        'sensor.a1_external_spool_external_spool': { state: 'Bambu PETG Basic', attributes: a1External },
+        status: 'finish',
+        progress: '100',
+        stage: 'idle',
+        startTime: '2026-10-13T22:08:55+00:00',
+        taskName: 'Old print',
+        printWeight: pw({ 'External Spool': 0.98 }),
+      },
+      initialAt: '2026-10-14T07:00:00.000Z',
+    });
+    await r.start();
+    await replay(r, '14', [
+      ['08:16:44.915', { status: 'prepare', startTime: '2026-10-14T08:16:00+00:00' }],
+      ['08:16:54.290', { stage: 'heatbed_preheating', progress: '0', status: 'running' }],
+      ['08:21:31.689', { stage: 'cleaning_nozzle_tip', progress: '64' }],
+      ['08:22:47.169', { status: 'failed' }],
+    ]);
+    const [job] = store.listJobs();
+    assert.deepEqual([job.state, job.total_grams, job.max_progress], ['failed', 0, 64]);
+    assert.deepEqual(store.getJobSources(job.id), []);
+    assert.deepEqual(r.spoolman.calls, []); // no location patch or first_used from stale data
+  });
+
+  test('P2S 63% failure: baseline 60 from the "printing" update -> 3/40 of the grams', async () => {
+    const r = rig({ initial: p2sBefore, initialAt: '2026-10-12T22:30:00.000Z' });
+    await r.start();
+    await replay(r, '12', p2s63);
+    const [job] = store.listJobs();
+    assert.deepEqual([job.stage_tracked, job.print_baseline, job.max_progress], [1, 60, 63]);
+    assert.deepEqual(r.usage(), [['AMS 1 Tray 2', 2, 0.04, 'applied']]); // 0.56 g x 3/40
+  });
+
+  test('returning to printing after a pause or offline keeps the first baseline', async () => {
+    const r = rig({ initial: p2sBefore, initialAt: '2026-10-12T22:30:00.000Z' });
+    await r.start();
+    await replay(r, '12', [
+      ['22:43:52.840', { progress: '0', status: 'prepare', startTime: '2026-10-12T22:43:00+00:00' }],
+      ['22:43:55.405', { status: 'running', startTime: '2026-10-12T22:43:49+00:00', printWeight: pw(printWeight.failedAt63) }],
+      ['22:49:38.902', { stage: 'printing', progress: '40' }],
+      ['22:52:00.000', { stage: 'paused_user', status: 'pause', progress: '55' }],
+      ['22:55:00.000', { stage: 'printing', status: 'running' }],
+      ['22:56:00.000', { progress: '70' }],
+      ['22:57:00.000', { status: 'offline', stage: 'offline' }],
+      ['22:57:30.000', { status: 'running', stage: 'printing', progress: '80' }],
+      ['22:58:00.000', { status: 'failed', stage: 'idle' }],
+    ]);
+    assert.equal(store.listJobs()[0].print_baseline, 40);
+    assert.deepEqual(r.usage(), [['AMS 1 Tray 2', 2, 0.37, 'applied']]); // 0.56 g x 40/60
+  });
+
+  test('a fresh job whose stage already says "printing" has an unknown baseline: plain progress', async () => {
+    const r = rig({ initial: p2sBefore });
+    await r.start();
+    await r.push({ status: 'prepare', progress: '0', stage: 'printing', startTime: T1, printWeight: pw(printWeight.failedAt63) });
+    assert.equal(store.listJobs()[0].stage_tracked, 0);
+  });
+
+  const adoptedMidPrint = {
+    status: 'running',
+    stage: 'printing',
+    progress: '61',
+    startTime: '2026-10-12T22:43:49+00:00',
+    taskName: 'Test print',
+    printWeight: pw(printWeight.failedAt63),
+  };
+
+  test('bridge starts mid-print: the baseline is rebuilt from HA history', async () => {
+    const r = rig({ initial: adoptedMidPrint, initialAt: '2026-10-12T22:49:42.325Z', history: p2sHistory });
+    await r.start();
+    const [job] = store.listJobs();
+    assert.deepEqual([job.adopted, job.stage_tracked, job.print_baseline, job.max_progress], [1, 1, 60, 61]);
+    assert.deepEqual(r.tracker.ha.historyCalls[0].ids, ['sensor.p2s_current_stage', 'sensor.p2s_print_progress']);
+    assert.ok(r.tracker.ha.historyCalls[0].since <= Date.parse('2026-10-12T22:43:49+00:00'));
+    await r.push({ progress: '63' }, '2026-10-12T22:49:57.018Z');
+    await r.push({ status: 'failed', stage: 'idle' }, '2026-10-12T22:50:02.835Z');
+    assert.deepEqual(r.usage(), [['AMS 1 Tray 2', 2, 0.04, 'applied']]);
+  });
+
+  test('bridge starts mid-print and HA history fails: plain progress, as before', async () => {
+    const r = rig({ initial: adoptedMidPrint, initialAt: '2026-10-12T22:49:42.325Z' }); // history throws
+    await r.start();
+    assert.equal(store.listJobs()[0].stage_tracked, 0);
+    await r.push({ progress: '63' }, '2026-10-12T22:49:57.018Z');
+    await r.push({ status: 'failed', stage: 'idle' }, '2026-10-12T22:50:02.835Z');
+    assert.deepEqual(r.usage(), [['AMS 1 Tray 2', 2, 0.35, 'applied']]);
+  });
+
+  test('bridge starts before printing began: tracked, and the live "printing" sets the baseline', async () => {
+    const r = rig({
+      initial: { ...adoptedMidPrint, stage: 'cleaning_nozzle_tip', progress: '3' },
+      initialAt: '2026-10-12T22:48:03.358Z',
+      history: (ids) => ({ [ids[0]]: [{ state: 'cleaning_nozzle_tip', time: Date.parse('2026-10-12T22:46:54.496Z') }], [ids[1]]: [] }),
+    });
+    await r.start();
+    assert.deepEqual([store.listJobs()[0].stage_tracked, store.listJobs()[0].print_baseline], [1, null]);
+    await r.push({ stage: 'printing', progress: '60' }, '2026-10-12T22:49:38.902Z');
+    assert.equal(store.listJobs()[0].print_baseline, 60);
+  });
+
+  test('bridge restart with an open tracked job: a "printing" missed while down comes from history', async () => {
+    const r = rig({ initial: adoptedMidPrint, initialAt: '2026-10-12T22:49:42.325Z', history: p2sHistory });
+    const jobId = store.createJob({ printer: 'p2s', taskName: 'Test print', startTime: '2026-10-12T22:43:49+00:00', stageTracked: true, dryRun: false });
+    store.replaceJobSources(jobId, [{ sourceKey: 'AMS 1 Tray 2', grams: 0.56, kind: 'ams', unit: 1, slot: 2, spoolId: 2, resolution: 'tag' }]);
+    await r.start();
+    assert.equal(store.getJob(jobId).print_baseline, 60);
+    await r.push({ progress: '63' }, '2026-10-12T22:49:57.018Z');
+    await r.push({ status: 'failed', stage: 'idle' }, '2026-10-12T22:50:02.835Z');
+    assert.deepEqual(r.usage(), [['AMS 1 Tray 2', 2, 0.04, 'applied']]);
   });
 });

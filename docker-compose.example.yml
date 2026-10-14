@@ -10,6 +10,7 @@ services:
       - .env
     environment:
       DATA_DIR: /data
+      # Log timestamps use this zone, e.g. Europe/Zagreb
       TZ: Etc/UTC
     ports:
       - "8080:8080"

@@ -23,10 +23,19 @@ which spool each print used and deducts the grams when the print ends. The norma
    - If `print_weight` is corrected before the print reports any progress, the snapshot is taken again.
 2. **During the print** the highest `print_progress` is persisted on every increase. Only progress
    reported after the print started counts, never a value left over from the previous print.
-3. **Print end**: `finish` deducts the full slicer estimate per source. `failed` (error or cancel)
-   deducts `grams × max progress / 100`. A print cancelled before it reported any progress deducts
-   nothing and touches no spool. Every deduction goes to `usage_log`, which is the usage
-   history Spoolman itself doesn't keep.
+3. **Print end**: `finish` deducts the full slicer estimate per source. For `failed` (error or
+   cancel), the deduction depends on how far real printing got:
+   - `print_progress` is gcode progress, and the start sequence (heating, bed leveling, calibration,
+     purge) is part of the gcode. On small prints it can pass 60–80% before the first layer.
+   - So the bridge records the progress at which `current_stage` first becomes `printing` (the
+     baseline), and deducts `grams × (max progress − baseline) / (100 − baseline)`.
+   - A print that never reached `printing`, or never reported progress, deducts nothing and touches
+     no spool.
+   - If the bridge restarts mid-print, the baseline is rebuilt from Home Assistant's history.
+   - Without a `current_stage` entity, or if the baseline can't be determined, a failed print falls
+     back to `grams × max progress / 100`.
+
+   Every deduction goes to `usage_log`, which is the usage history Spoolman itself doesn't keep.
 
 ### Finding the spool
 
@@ -71,6 +80,7 @@ All configuration is environment variables; see [.env.example](.env.example).
 | `BRIDGE_URL` | no | | Bridge address for the *Open bridge* button, e.g. `http://<bridge-host>:8080` |
 | `DRY_RUN` | no | `true` | Anything but `false` keeps Spoolman untouched |
 | `LOG_LEVEL` | no | `info` | `debug` also logs the AMS remain% vs. Spoolman gap per spool |
+| `TZ` | no | system zone | Log timestamps are local time in this zone with their offset, e.g. `Europe/Zagreb` → `2026-10-14T10:16:44.915+02:00` |
 | `PORT` | no | `8080` | HTTP port |
 | `DATA_DIR` | no | `/data` | Where `bridge.db` lives |
 | `JOB_START_TOLERANCE_SEC` | no | `120` | `start_time` jitter treated as the same print |
@@ -89,7 +99,7 @@ All configuration is environment variables; see [.env.example](.env.example).
 `prefix` is the part of the entity IDs between `sensor.` and `_print_status`. `{unit}` is the AMS number
 as in HA (`ams_1` = 1) and `{n}` is the slot. Optional per printer: `refreshDelayMs` (default 5000) and
 `entities` to override entity IDs (`status`, `progress`, `printWeight`, `startTime`, `taskName`,
-`activeTray`, `externalSpool`, `refreshButton`).
+`activeTray`, `stage`, `externalSpool`, `refreshButton`).
 
 At startup the bridge logs a table of every entity it found or missed. A printer with missing required
 entities (`print_status`, `print_progress`, `print_weight`) is not tracked.

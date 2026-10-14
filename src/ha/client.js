@@ -31,6 +31,19 @@ export async function connectHa({ url, token, log }) {
     callService: (domain, service, data, target) => callService(conn, domain, service, data, target),
     pressButton: (entityId) => callService(conn, 'button', 'press', undefined, { entity_id: entityId }),
     subscribeEvent: (eventType, cb) => conn.subscribeEvents(cb, eventType),
+    // Read-only recorder history as { entityId: [{ state, time }] }, time in ms, ascending.
+    // The first row of each entity is its state at startTime.
+    async history(entityIds, startTime) {
+      const res = await conn.sendMessagePromise({
+        type: 'history/history_during_period',
+        start_time: new Date(startTime).toISOString(),
+        entity_ids: entityIds,
+        minimal_response: true,
+        no_attributes: true,
+        significant_changes_only: false,
+      });
+      return Object.fromEntries(entityIds.map((id) => [id, (res[id] || []).map((r) => ({ state: r.s, time: (r.lu ?? r.lc) * 1000 }))]));
+    },
     close: () => conn.close(),
   };
 }

@@ -1,6 +1,6 @@
 {
   "name": "bambu-spoolman-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Tracks Bambu Lab filament consumption from Home Assistant in Spoolman",
   "private": true,
   "type": "module",

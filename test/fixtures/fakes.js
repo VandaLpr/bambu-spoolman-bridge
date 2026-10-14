@@ -144,6 +144,7 @@ export function createWorld(prefix, initial = {}, initialAt = undefined) {
     startTime: `sensor.${prefix}_start_time`,
     taskName: `sensor.${prefix}_task_name`,
     activeTray: `sensor.${prefix}_active_tray`,
+    stage: `sensor.${prefix}_current_stage`,
     externalSpool: `sensor.${prefix}_external_spool_external_spool`,
   };
   const tray = (n) => `sensor.${prefix}_ams_1_tray_${n}`;

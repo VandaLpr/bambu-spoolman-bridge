@@ -21,7 +21,7 @@
 
 import Database from 'better-sqlite3';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const SCHEMA = `
 CREATE TABLE jobs (
@@ -104,14 +104,16 @@ export function openStore(file) {
   const parsePending = (row) => row && { ...row, candidates: JSON.parse(row.candidates) };
 
   const q = {
-    insertJob: stmt(`INSERT INTO jobs (printer, task_name, start_time, started_at, state, adopted, dry_run, created_at)
-                     VALUES (@printer, @taskName, @startTime, @startedAt, 'active', @adopted, @dryRun, @createdAt)`),
+    insertJob: stmt(`INSERT INTO jobs (printer, task_name, start_time, started_at, state, adopted, stage_tracked, dry_run, created_at)
+                     VALUES (@printer, @taskName, @startTime, @startedAt, 'active', @adopted, @stageTracked, @dryRun, @createdAt)`),
     activeJob: stmt(`SELECT * FROM jobs WHERE printer = ? AND state = 'active' ORDER BY id DESC LIMIT 1`),
     activeJobs: stmt(`SELECT * FROM jobs WHERE state = 'active' ORDER BY id`),
     job: stmt(`SELECT * FROM jobs WHERE id = ?`),
     jobMeta: stmt(`UPDATE jobs SET task_name = COALESCE(@taskName, task_name), start_time = COALESCE(@startTime, start_time)
                    WHERE id = @id`),
     raiseProgress: stmt(`UPDATE jobs SET max_progress = @progress WHERE id = @id AND max_progress < @progress`),
+    setBaseline: stmt(`UPDATE jobs SET print_baseline = @baseline WHERE id = @id AND print_baseline IS NULL`),
+    setStageTracking: stmt(`UPDATE jobs SET stage_tracked = @tracked, print_baseline = @baseline WHERE id = @id`),
     endJob: stmt(`UPDATE jobs SET state = @state, total_grams = @totalGrams, ended_at = @endedAt
                   WHERE id = @id AND state = 'active'`),
     listJobs: stmt(`SELECT * FROM jobs ORDER BY id DESC LIMIT ?`),
@@ -160,9 +162,13 @@ export function openStore(file) {
     close: () => db.close(),
 
     // startedAt: HA timestamp of the status change that started the job (print_weight must be newer)
-    createJob({ printer, taskName = null, startTime = null, startedAt = null, adopted = false, dryRun }) {
+    // stageTracked: the job follows current_stage, so failed prints are deducted from the
+    // progress at which real printing began (print_baseline) instead of from 0.
+    createJob({ printer, taskName = null, startTime = null, startedAt = null, adopted = false, stageTracked = false, dryRun }) {
       return Number(
-        q.insertJob.run({ printer, taskName, startTime, startedAt, adopted: bool(adopted), dryRun: bool(dryRun), createdAt: now() }).lastInsertRowid,
+        q.insertJob.run({
+          printer, taskName, startTime, startedAt, adopted: bool(adopted), stageTracked: bool(stageTracked), dryRun: bool(dryRun), createdAt: now(),
+        }).lastInsertRowid,
       );
     },
     getJob: (id) => q.job.get(id),
@@ -172,6 +178,10 @@ export function openStore(file) {
     updateJobMeta: (id, { taskName = null, startTime = null }) => q.jobMeta.run({ id, taskName, startTime }),
     // Persisted on every increase so a failed print survives a restart with its real progress.
     raiseMaxProgress: (id, progress) => q.raiseProgress.run({ id, progress }).changes > 0,
+    // Written once: the first time the stage becomes "printing". Later returns to printing
+    // (after pause, offline, filament change) leave it alone.
+    setPrintBaseline: (id, baseline) => q.setBaseline.run({ id, baseline }).changes > 0,
+    setStageTracking: (id, tracked, baseline = null) => q.setStageTracking.run({ id, tracked: bool(tracked), baseline }),
     endJob: (id, state, totalGrams = null) => q.endJob.run({ id, state, totalGrams, endedAt: now() }).changes > 0,
     listJobs: (limit = 50) => q.listJobs.all(limit),
     lastEndedJob: (printer) => q.lastEndedJob.get(printer),
@@ -244,6 +254,10 @@ function migrate(db) {
     if (version < 1) db.exec(SCHEMA);
     if (version < 2) db.exec(`ALTER TABLE usage_log ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`);
     if (version < 3) db.exec(`ALTER TABLE jobs ADD COLUMN started_at TEXT`);
+    if (version < 4) {
+      db.exec(`ALTER TABLE jobs ADD COLUMN stage_tracked INTEGER NOT NULL DEFAULT 0`);
+      db.exec(`ALTER TABLE jobs ADD COLUMN print_baseline REAL`);
+    }
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
   })();
 }
